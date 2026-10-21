@@ -10849,10 +10849,25 @@ void float11_11_10TargetTests() {
     changed = queue;
     changed.context[0x1e0] = 0x60010101u;
     for (std::uint32_t i = 0; i < 4; ++i) changed.context[0x105 + i] = 0;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "blending into an 11_11_10 float color target");
+    const auto additive = AgcDriver::Graphics::DecodeState(changed);
+    Require(additive.color.mergeBlend == 0x40000101u && additive.color.partialWriteMask == 0xffffffffu && !additive.blends[0].blendEnable && additive.blends[0].colorWriteMask == 0u, "an additive blend into an 11_11_10 float target did not decode as a blending merge of the whole word");
+    const auto additiveMerge = AgcDriver::Graphics::ExportTargetMerge(additive);
+    Require(additiveMerge.mask == 0xffffffffu && additiveMerge.packing == ColorExportPacking::Float11_11_10 && additiveMerge.blendControl == 0x40000101u, "the additive 11_11_10 float blend did not reach the pixel shader's target merge");
+    changed.context[0x1e0] = 0x65040504u;
+    Require(AgcDriver::Graphics::DecodeState(changed).color.mergeBlend == 0x40000504u, "a source-over blend into an 11_11_10 float target did not keep its color equation");
+    changed.context[0x1e0] = 0x40000001u;
+    const auto replace = AgcDriver::Graphics::DecodeState(changed);
+    Require(replace.color.mergeBlend == 0x40000001u && replace.color.partialWriteMask == 0xffffffffu && !replace.blends[0].blendEnable, "a ONE/ZERO/ADD blend into an 11_11_10 float target did not merge with its color equation");
+    changed.context[0x1e0] = 0x40000d01u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "blending into an 11_11_10 float color target with a constant color factor");
+    changed.context[0x1e0] = 0x40000f01u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "dual-source blending into an 11_11_10 float color target");
+    changed.context[0x1e0] = 0x400001a1u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "unsupported blend operation 5");
     changed = queue;
     changed.context[0x8e] = 6;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "partial writes of an 11_11_10 float color target");
+    const auto partial = AgcDriver::Graphics::DecodeState(changed);
+    Require(partial.color.partialWriteMask == 0x001fffffu && partial.color.mergeBlend == 0u, "a green and blue write of an 11_11_10 float target did not merge into the word's low 21 bits");
     changed.context[0x8e] = 7;
     Require(AgcDriver::Graphics::DecodeState(changed).color.packing == ColorExportPacking::Float11_11_10, "an RGB write of an 11_11_10 float target was refused");
     for (const auto format : {5u, 6u}) {

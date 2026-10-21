@@ -6,7 +6,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 47u;
+constexpr std::uint32_t CurrentVersion = 48u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr char kBase64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -375,6 +375,8 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     for (const std::uint32_t word : info.targetMerge.descriptor) writer.WriteU32(word);
     writer.WriteBool(info.targetMerge.depthStencilWrites);
     writer.WriteBool(info.targetMerge.depthStencilTests);
+    writer.WriteU8(static_cast<std::uint8_t>(info.targetMerge.packing));
+    writer.WriteU32(info.targetMerge.blendControl);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::uint32_t local) {
@@ -457,13 +459,18 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version, std::u
     }
     if (version >= 46u) {
         info.targetMerge.target = reader.ReadU8();
-        const auto mask = reader.ReadU32();
-        if (mask > 0xffffu) throw std::runtime_error("invalid recompile request target merge mask");
-        info.targetMerge.mask = static_cast<std::uint16_t>(mask);
+        info.targetMerge.mask = reader.ReadU32();
+        if (version < 48u && info.targetMerge.mask > 0xffffu) throw std::runtime_error("invalid recompile request target merge mask");
         info.targetMerge.samples = reader.ReadU8();
         for (std::uint32_t& word : info.targetMerge.descriptor) word = reader.ReadU32();
         info.targetMerge.depthStencilWrites = reader.ReadBool();
         info.targetMerge.depthStencilTests = reader.ReadBool();
+        if (version >= 48u) {
+            info.targetMerge.packing = readColorExportPacking(reader);
+            info.targetMerge.blendControl = reader.ReadU32();
+        } else if (info.targetMerge.mask != 0u) {
+            info.targetMerge.packing = ColorExportPacking::Unorm4_4_4_4;
+        }
     }
     if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };

@@ -84,6 +84,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.targetMerge.target);
             mix(pixel.targetMerge.mask);
             mix(pixel.targetMerge.samples);
+            mix(static_cast<std::uint64_t>(pixel.targetMerge.packing));
+            mix(pixel.targetMerge.blendControl);
             for (const auto word : pixel.targetMerge.descriptor) mix(word);
             mix(pixel.targetMerge.depthStencilWrites);
             mix(pixel.targetMerge.depthStencilTests);
