@@ -1828,7 +1828,11 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         if (const auto info = read(cx, 0x31c + slot * 0xfu); state.blendEnable && (info & 0x8000u) == 0 && ((info >> 8u) & 7u) <= 1u) {
             char detail[80];
             std::snprintf(detail, sizeof(detail), " (CB_COLOR_INFO 0x%08x, CB_BLEND%u_CONTROL 0x%08x)", info, slot, blend);
-            throw std::runtime_error(std::string("AGC graphics: blending unclamped normalized color is not implemented") + detail);
+            const std::string where = detail;
+            Require(color.samples == 1u && color.packing == ShaderRecompiler::ColorExportPacking::None, "blending unclamped normalized color into a multisampled or packed color target is not implemented" + where);
+            Require(!reversed && mapping != 0xecu, "blending unclamped normalized color into a color target with a reversed or alternate component order is not implemented" + where);
+            Require(!(secondSource(state.srcColorBlendFactor) || secondSource(state.dstColorBlendFactor) || secondSource(state.srcAlphaBlendFactor) || secondSource(state.dstAlphaBlendFactor)), "dual-source blending of unclamped normalized color is not implemented" + where);
+            color.partialWriteMask = UnclampedBlendMask;
         }
         result.blends[color.exportIndex] = state;
     }
@@ -1939,7 +1943,12 @@ bool DepthStencilTests(const State& state) {
     return state.depth.has_value() && (state.depthTest || state.stencilTest || state.depthBoundsTest);
 }
 
+static bool SignedNormalizedFormat(VkFormat format) {
+    return format == VK_FORMAT_R8_SNORM || format == VK_FORMAT_R16_SNORM || format == VK_FORMAT_R8G8_SNORM || format == VK_FORMAT_R16G16_SNORM || format == VK_FORMAT_R8G8B8A8_SNORM || format == VK_FORMAT_B8G8R8A8_SNORM || format == VK_FORMAT_R16G16B16A16_SNORM;
+}
+
 ShaderRecompiler::TargetMerge ExportTargetMerge(const State& state) {
+    static_assert(VK_BLEND_FACTOR_ZERO == 0 && VK_BLEND_FACTOR_SRC_ALPHA_SATURATE == 14 && VK_BLEND_OP_ADD == 0 && VK_BLEND_OP_MAX == 4);
     ShaderRecompiler::TargetMerge merge;
     for (const auto& color : state.colors) {
         if (color.partialWriteMask == 0) continue;
@@ -1953,6 +1962,19 @@ ShaderRecompiler::TargetMerge ExportTargetMerge(const State& state) {
         merge.descriptor = EncodeTextureResource(TargetMergeSurface(color));
         merge.depthStencilWrites = DepthStencilWrites(state);
         merge.depthStencilTests = DepthStencilTests(state);
+        if (color.partialWriteMask != UnclampedBlendMask) continue;
+        const auto& attachment = state.blends.at(color.exportIndex);
+        auto& blend = merge.blend;
+        blend.enabled = true;
+        blend.snorm = SignedNormalizedFormat(color.format);
+        blend.colorSource = static_cast<std::uint8_t>(attachment.srcColorBlendFactor);
+        blend.colorDestination = static_cast<std::uint8_t>(attachment.dstColorBlendFactor);
+        blend.colorOperation = static_cast<std::uint8_t>(attachment.colorBlendOp);
+        blend.alphaSource = static_cast<std::uint8_t>(attachment.srcAlphaBlendFactor);
+        blend.alphaDestination = static_cast<std::uint8_t>(attachment.dstAlphaBlendFactor);
+        blend.alphaOperation = static_cast<std::uint8_t>(attachment.alphaBlendOp);
+        blend.writeMask = static_cast<std::uint8_t>(attachment.colorWriteMask & 0xfu);
+        for (std::size_t i = 0; i < 4; ++i) blend.constants[i] = std::bit_cast<std::uint32_t>(state.blendConstants[i]);
     }
     return merge;
 }
