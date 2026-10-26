@@ -1913,6 +1913,17 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(static_cast<std::uint64_t>(merge.packing));
         mix(merge.blendControl);
         for (const auto word : merge.descriptor) mix(word);
+        if (merge.blend.enabled) {
+            mix(merge.blend.snorm);
+            mix(merge.blend.colorSource);
+            mix(merge.blend.colorDestination);
+            mix(merge.blend.colorOperation);
+            mix(merge.blend.alphaSource);
+            mix(merge.blend.alphaDestination);
+            mix(merge.blend.alphaOperation);
+            mix(merge.blend.writeMask);
+            for (const auto word : merge.blend.constants) mix(word);
+        }
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;

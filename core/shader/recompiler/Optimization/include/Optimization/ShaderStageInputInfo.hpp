@@ -206,6 +206,7 @@ struct ShaderPixelInputInfo {
     std::uint32_t mergeBlendControl = 0;
     bool mergeDepthStencilWrites = false;
     bool mergeDepthStencilTests = false;
+    TargetBlend mergeBlend{};
     std::array<std::uint32_t, 4> sampleOrder{};
     ShaderStageRuntime stage;
 
