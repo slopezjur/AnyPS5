@@ -5,7 +5,6 @@
 #include "SceTypes.hpp"
 
 int ValidateVideoOutOutputMode_nid_no_patch(uint64_t mode, const VideoOutOutputOptions* options, int displayRefreshRate);
-int VideoOutOutputSupport_nid_no_patch(uint64_t mode, const VideoOutOutputOptions* options, int displayRefreshRate);
 
 extern "C" {
 

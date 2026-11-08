@@ -384,7 +384,7 @@ std::optional<std::pair<std::uint32_t, std::uint32_t>> storedLaneFunction(const 
     bool function = false;
     for (std::size_t offset = 5; offset < words.size(); offset += words[offset] >> spv::WordCountShift) {
         const auto opcode = static_cast<spv::Op>(words[offset] & spv::OpCodeMask);
-        const auto* operands = words.data() + offset + 1;
+        const auto* operands = &words[offset + 1];
         if (opcode == spv::OpFunction) function = true;
         if (opcode == spv::OpConstant) values[operands[1]] = {0u, operands[2]};
         if (opcode == spv::OpVariable && operands[2] == spv::StorageClassInput) inputs.insert(operands[1]);
@@ -487,7 +487,7 @@ OpFunctionEnd
         bool shared = true;
         for (const auto& [constant, count] : constants) shared &= count == 1u;
         check(shared, "specialization emitted one value of one type as several constants");
-        check(constants.size() == 5u, "specialization kept an unreferenced folded constant or lost a referenced one");
+        check(constants.size() == 3u, "specialization kept an unreferenced folded constant or lost a referenced one");
         check(opcodeCount(specialized, spv::OpConstantTrue) + opcodeCount(specialized, spv::OpConstantFalse) == 0u, "specialization kept an unreferenced folded condition");
         check(names == 0u, "specialization kept the name of a dropped constant");
         check(opcodeCount(specialized, spv::OpBitcast) == 0u, "specialization kept a bitcast to the operand's own type or back to the original type");

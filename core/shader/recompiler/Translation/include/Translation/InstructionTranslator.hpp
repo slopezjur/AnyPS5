@@ -30,22 +30,21 @@ struct TranslateOptions {
     std::uint32_t userDataBaseRegister = 0;
     std::uint32_t userDataCount = 64;
     std::uint32_t scratchDwords = 0;
-    std::uint32_t sharedVectorBase = 0;
-    std::uint32_t sharedVectorCount = 0;
     std::uint32_t sharedMemoryBytes = 0;
     std::uint64_t shaderHash = 0;
     bool fragmentShaderBarycentricEnabled = false;
     bool interpolationFunctions = false;
     bool nativeFloat16 = false;
     bool float32FlushToZero = false;
-    bool float32FlushDeclared = false;
     bool float32DenormPreserve = false;
-    bool float64 = false;
     bool gcnLegacyVertexInputs = false;
-    bool nativeFloat16Fma = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
+    // GPU-side indirect draw parameters (ShaderVertexStageInfo::drawBaseVertexSgpr): user SGPRs
+    // read from BaseVertex / BaseInstance, with the index VGPRs relative to them; -1 for none.
+    std::int32_t drawBaseVertexSgpr = -1;
+    std::int32_t drawStartInstanceSgpr = -1;
 };
 
 class InstructionTranslator {

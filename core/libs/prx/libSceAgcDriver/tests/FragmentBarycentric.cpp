@@ -29,9 +29,5 @@ int main() {
             ++failures;
         }
     }
-    if (!AgcDriver::HostInterpolationPreferred(VK_DRIVER_ID_MESA_RADV) || AgcDriver::HostInterpolationPreferred(VK_DRIVER_ID_NVIDIA_PROPRIETARY) || AgcDriver::HostInterpolationPreferred(VK_DRIVER_ID_AMD_PROPRIETARY)) {
-        std::fprintf(stderr, "host interpolation must be preferred on RADV only\n");
-        ++failures;
-    }
     return failures == 0 ? 0 : 1;
 }

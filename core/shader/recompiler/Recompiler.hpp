@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "BindlessImageAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
@@ -14,8 +15,8 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <ranges>
 #include <stdexcept>
+#include <ranges>
 #include <functional>
 #include <utility>
 #include <string_view>
@@ -66,8 +67,13 @@ struct ShaderComputeStageInfo {
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
     std::uint32_t scratchDwords = 0;
-    std::uint32_t granulatedVgprCount = 0;
-    std::uint32_t sharedVgprBlocks = 0;
+    // The dispatch runs exactly one workgroup (a direct dispatch of 1x1x1 groups, set by the driver):
+    // the guest's glc buffer loads then only need workgroup-scope coherence, since every other
+    // writer of the buffer that can run beside them is an invocation of the same workgroup on the
+    // same SM (other dispatches are ordered by the barriers between them). The SPIR-V reads them
+    // through the L1-cached binding and s_barrier also orders buffer memory (SpirvRuntimeBuffer,
+    // SpirvFlowEmitter). Set only with APS5_SINGLE_GROUP_COHERENCE=1 (driver, opt-in: not shown exact).
+    bool singleWorkgroup = false;
 
     [[nodiscard]] bool PartialGroups() const {
         return partialThreads != std::array<std::uint32_t, 3>{};
@@ -133,9 +139,7 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm10_11_11,
     Float11_11_10,
     Unorm4_4_4_4,
-    Uint,
-    UintClamp8,
-    UintClamp16
+    Uint
 };
 
 enum class RasterPrimitive : std::uint8_t {
@@ -143,6 +147,15 @@ enum class RasterPrimitive : std::uint8_t {
     Line,
     Triangle,
     Rectangle
+};
+
+struct ColorTargetBlend {
+    bool enable = false;
+    std::uint8_t sourceFactor = 0;
+    std::uint8_t destinationFactor = 0;
+    std::uint8_t function = 0;
+    std::uint8_t writeMask = 0;
+    bool operator==(const ColorTargetBlend&) const = default;
 };
 
 enum class PixelPositionLocation : std::uint8_t {
@@ -172,34 +185,13 @@ inline constexpr std::uint32_t One = 3u;
 
 }
 
-struct TargetBlend {
-    bool enabled = false;
-    bool snorm = false;
-    std::uint8_t colorSource = 0;
-    std::uint8_t colorDestination = 0;
-    std::uint8_t colorOperation = 0;
-    std::uint8_t alphaSource = 0;
-    std::uint8_t alphaDestination = 0;
-    std::uint8_t alphaOperation = 0;
-    std::uint8_t writeMask = 0;
-    std::array<std::uint32_t, 4> constants{};
-
-    bool operator==(const TargetBlend&) const = default;
-};
-
 struct TargetMerge {
     std::uint8_t target = 0;
-    std::uint32_t mask = 0;
+    std::uint16_t mask = 0;
     std::uint8_t samples = 1;
-    ColorExportPacking packing = ColorExportPacking::None;
-    std::uint32_t blendControl = 0;
-    bool layered = false;
-    std::uint32_t firstSlice = 0;
-    std::uint32_t lastSlice = 0;
     std::array<std::uint32_t, 8> descriptor{};
     bool depthStencilWrites = false;
     bool depthStencilTests = false;
-    TargetBlend blend{};
 
     bool operator==(const TargetMerge&) const = default;
 };
@@ -223,8 +215,6 @@ struct ShaderPixelStageInfo {
     bool linearCentroid;
     bool pixelKillEnable;
     bool depthExportEnable;
-    float depthExportMin = 0.0f;
-    float depthExportMax = 1.0f;
     bool sampleMaskExportEnable;
     bool earlyZ;
     bool executeOnNoop;
@@ -240,14 +230,14 @@ struct ShaderPixelStageInfo {
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
     bool ditheredAlphaToCoverage = false;
-    std::uint8_t ditheredAlphaSamples = 8;
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    std::array<ColorTargetBlend, 8> targetBlend;
     std::uint32_t reversedBlend = 0;
     bool iteratesSamples = false;
     PixelPositionLocation positionLocation = PixelPositionLocation::Center;
     std::array<std::uint8_t, 32> sampleLocations{};
-    std::vector<TargetMerge> targetMerges{};
+    TargetMerge targetMerge{};
     std::array<std::uint32_t, 4> sampleOrder{};
 };
 
@@ -271,6 +261,13 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    // GPU-side indirect draw parameters (gpuind): the user SGPRs the CP writes a record's base
+    // vertex and start instance into for an indirect draw on the vertex path, or -1. A stage
+    // compiled with one of them set reads that SGPR from BaseVertex / BaseInstance and takes the
+    // vertex / instance index VGPR as VertexIndex - BaseVertex / InstanceIndex - BaseInstance (the
+    // record's raw index), so the driver records vkCmdDraw*Indirect without reading the records.
+    std::int32_t drawBaseVertexSgpr = -1;
+    std::int32_t drawStartInstanceSgpr = -1;
     std::uint32_t depthRemapMode = 0;
     bool pointList = false;
     float pointSize = 1.0f;
@@ -303,15 +300,7 @@ struct GuestContext {
     std::optional<ShaderFloatMode> floatMode;
     std::span<const std::uint32_t> linkedCallFallbacks;
     bool convertedSamples = false;
-    bool layerRowSamples = false;
 };
-
-struct SharedVectorRegisters {
-    std::uint32_t base = 0;
-    std::uint32_t count = 0;
-};
-
-[[nodiscard]] SharedVectorRegisters GuestSharedVectorRegisters(const GuestContext& context);
 
 struct MeshTargetLimits {
     std::array<std::uint32_t, 3> maxWorkgroupSize;
@@ -348,23 +337,21 @@ struct SpirvTarget {
     std::uint32_t maxWorkgroupSharedMemoryBytes;
     std::optional<MeshTargetLimits> mesh;
     std::optional<TessellationTargetLimits> tessellation;
-    std::array<std::uint64_t, 2> featureDigest{};
-    std::array<std::uintptr_t, 4> featureDigestSpans{};
-    bool featureDigestSealed = false;
     bool nonConstantImageOffsets = false;
     std::uint32_t srgbDecodeFormats = 0;
-    std::uint32_t maxImageArrayLayers = 0;
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
-    bool tessellationEvaluationSubgroups = true;
     bool float16DenormPreserve = false;
+    bool bindlessImages = false;
     bool spannedWaves = false;
+    // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
+    // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
+    bool fusedFma = false;
     bool robustBufferAccess2 = false;
-    bool exactRobustLoads = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;
     bool waveLdsMemoryBarriers = false;
@@ -373,13 +360,6 @@ struct SpirvTarget {
     bool largePixelFunctionLdsBuffer = false;
     std::uint32_t pixelFunctionStorageDwords = 4096u;
     bool deviceScopeLdsMemoryBarriers = false;
-    bool ldsLockFences = false;
-    bool fragmentBarycentricBuiltins = false;
-    bool meshWindowBuffer = false;
-    bool hostInterpolationFirst = false;
-    bool shaderImageMinLod = false;
-    bool float16WidenNans = false;
-    bool float16NarrowNans = false;
 };
 
 struct BindingLayout {
@@ -444,18 +424,10 @@ inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
 inline constexpr std::uint32_t MeshArgumentBytes = 20;
 inline constexpr std::uint32_t MeshIndexRestartTable = 0x100;
-inline constexpr std::uint32_t MeshLayerStrideShift = 16;
-inline constexpr std::uint32_t MeshLayerStrideLimit = 0xffff;
 inline constexpr std::uint32_t MeshRestartLengthDword = MeshArgumentBytes / 4;
 inline constexpr std::uint32_t MeshRestartTableDword = MeshRestartLengthDword + 1;
-inline constexpr std::uint32_t MeshCapturedCounterDword = MeshArgumentBytes / 4;
-inline constexpr std::uint32_t MeshCapturedCapacityDword = MeshCapturedCounterDword + 1;
-inline constexpr std::uint32_t MeshCapturedHeaderBytes = 4 * (MeshCapturedCapacityDword + 1);
-inline constexpr std::uint32_t MeshCapturedItemAddressDword = 0;
-inline constexpr std::uint32_t TessellationCaptureArgumentAddressDword = 2;
 inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;
 inline constexpr std::uint32_t WorkgroupMemoryDescriptorSet = 1;
-inline constexpr std::uint32_t ScratchPoolDescriptorSet = 2;
 
 struct GraphicsDrawParameters {
     std::uint64_t indexAddress;
@@ -509,7 +481,7 @@ struct RecompileRequest {
 };
 
 inline std::uint32_t TessellationInstancePatches(const RecompileRequest& request) {
-    if (!request.graphics || !request.graphics->tessellation || request.graphics->draw.instanceCount <= 1u || request.graphics->tessellation->breakAtInstance || request.graphics->tessellation->inputControlPoints == 0u) return 0u;
+    if (!request.graphics || !request.graphics->tessellation || request.graphics->draw.instanceCount <= 1u || request.graphics->tessellation->breakAtInstance) return 0u;
     return request.graphics->draw.indexCount / request.graphics->tessellation->inputControlPoints;
 }
 
@@ -638,6 +610,8 @@ public:
         }
         while (count < size) push_back(flag);
     }
+    // Heap bytes held (the spill past the inline word), for the result memo's footprint.
+    std::size_t HeapBytes() const { return (spill.capacity() + 7u) / 8u; }
     const_iterator begin() const { return {this, 0}; }
     const_iterator end() const { return {this, count}; }
     bool operator==(const ElementFlags& other) const {
@@ -702,7 +676,7 @@ struct DescriptorBinding {
     ElementFlags samplerCoordinatesIgnored;
     ElementFlags imageUnnormalized;
     ElementFlags imageUnnormalizedBaseLevel;
-    std::vector<std::uint64_t> imageSamplers;
+    std::vector<std::uint32_t> imageSamplers;
     ElementFlags bufferRead;
     std::vector<std::uint32_t> bufferExtent;
 };
@@ -812,6 +786,8 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> Copy() const { return {Words().begin(), Words().end()}; }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
+    [[nodiscard]] bool Mapped() const { return holder != nullptr && holder->owner != nullptr; }
+    [[nodiscard]] std::size_t HeapBytes() const { return holder != nullptr && holder->owner == nullptr ? holder->words.capacity() * sizeof(std::uint32_t) : 0; }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Words()[index]; }
@@ -897,7 +873,6 @@ struct CompiledShaderArtifact {
     bool registrationModule = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t windowLaneGuards = 0;
-    std::uint32_t descriptorFaults = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
     std::vector<VertexInput> vertexInputs;
     std::int32_t vertexOffsetSgpr = -1;
@@ -909,8 +884,6 @@ struct CompiledShaderArtifact {
     std::uint32_t hostSubgroupSize = 0;
     bool fullSubgroups = false;
     bool functionLdsBuffer = false;
-    bool meshWindowBuffer = false;
-    std::uint32_t scratchPoolSlotDwords = 0;
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
@@ -918,8 +891,8 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
-    bool layerReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
+    bool bindlessHeap = false;
     std::uint64_t variantId = 0;
 };
 
@@ -937,6 +910,9 @@ struct ShaderInvocation {
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
+    bool hasDeferredDirectImage = false;
+    bool hasGuardedUnnormalizedWrap = false;
+    std::vector<BindlessImageAbi::TableRegistration> bindlessTables;
 };
 
 // What a Vulkan pipeline built from a result depends on besides the fixed-function state and the
@@ -981,7 +957,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
         };
         mix(specialization.size());
         for (const auto& constant : specialization) mix(constant.id | (static_cast<std::uint64_t>(constant.value) << 32u));
-        mix(hostSubgroupSize | (fullSubgroups ? 0x10000u : 0u) | (functionLdsBuffer ? 0x20000u : 0u) | (meshWindowBuffer ? 0x40000u : 0u) | (static_cast<std::uint64_t>(workgroupMemoryDwords) << 32u));
+        mix(hostSubgroupSize | (fullSubgroups ? 0x10000u : 0u) | (functionLdsBuffer ? 0x20000u : 0u) | (static_cast<std::uint64_t>(workgroupMemoryDwords) << 32u));
         mix(bindings.size());
         for (const auto& binding : bindings) mix(binding.descriptorSet | (static_cast<std::uint64_t>(binding.binding) << 16u) | (static_cast<std::uint64_t>(binding.kind) << 40u) | (static_cast<std::uint64_t>(binding.count) << 48u));
         if (identity.Empty()) identity.low = 1;
@@ -1010,12 +986,10 @@ struct MeshOutputBudget {
 [[nodiscard]] MeshOutputBudget MeshBarycentricOutputBudget(const MeshConfiguration& mesh, const MeshTargetLimits& limits, const MeshOutputUse& use);
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);
+[[nodiscard]] std::uint64_t ResultHeapBytes(const RecompileResult& result);
 
 struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
-void SetResultMemoBudget(std::uint64_t bytes);
-[[nodiscard]] std::uint64_t ResultMemoBytes();
-void SetResultMemoTrimHook(std::function<void()> hook);
 
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile
@@ -1024,7 +998,6 @@ void SetDebugProbeActive(bool active);
 [[nodiscard]] bool DebugProbeActive();
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
-[[nodiscard]] bool ExactF32Arithmetic();
 
 struct RectListShaders {
     RecompileResult control;
@@ -1043,7 +1016,6 @@ struct GeometryStageLimits {
 };
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
-[[nodiscard]] RecompileResult BuildTessellationCaptureGeometryShader(const MeshConfiguration& geometry, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
 struct BarycentricTessellationShaders {
     RecompileResult control;

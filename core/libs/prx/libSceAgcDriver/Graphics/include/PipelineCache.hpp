@@ -25,10 +25,9 @@ public:
     PipelineCache& operator=(const PipelineCache&) = delete;
     VkPipelineCache Handle() const { return cache; }
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
+    bool SaveUnlessCreating() { return save(false, false); }
     void SaveNow();
     void SaveUnlessBusy();
-
-    friend struct PipelineCacheTestAccess;
 
 private:
     struct FileHeader {
@@ -50,7 +49,7 @@ private:
     File readFile() const;
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
-    void save(bool final, bool waitForPipelines);
+    bool save(bool final, bool waitForPipelines);
     void run();
 
     Context context;
@@ -66,12 +65,6 @@ private:
     std::condition_variable wake;
     bool stopping = false;
     std::thread saver;
-};
-
-struct PipelineCacheTestAccess {
-    static bool HasHeader(const PipelineCache& cache) {
-        return cache.readHeader().has_value();
-    }
 };
 
 }

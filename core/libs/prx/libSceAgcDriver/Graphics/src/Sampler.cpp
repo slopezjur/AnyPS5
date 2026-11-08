@@ -1,23 +1,16 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
-#include "PipelineSpecialization.hpp"
 #include <algorithm>
-#include <bit>
 #include <cstdlib>
 #include <string>
+#include "UnnormalizedWrap.hpp"
 
 namespace AgcDriver::Graphics {
-
-    bool Sampler::ShaderAppliesLodBias(const GuestSamplerResource& descriptor) {
-        return descriptor.lodBias < -ShaderRecompiler::PipelineSpecialization::SamplerLodBiasShaderThreshold || descriptor.lodBias > ShaderRecompiler::PipelineSpecialization::SamplerLodBiasShaderThreshold;
-    }
 
     void Sampler::Validate(const Context& context, const GuestSamplerResource& descriptor) {
         Require(!descriptor.anisotropyEnable || context.samplerAnisotropy, "guest sampler descriptor requests anisotropic filtering which the device does not support");
         Require(descriptor.maxAnisotropy <= context.limits.maxSamplerAnisotropy, "guest sampler descriptor requests an anisotropy ratio beyond the device limit");
-        Require(ShaderAppliesLodBias(descriptor) || (descriptor.lodBias >= -context.limits.maxSamplerLodBias && descriptor.lodBias <= context.limits.maxSamplerLodBias), "guest sampler descriptor requests a LOD bias beyond the device limit");
-        const auto mirrorsOnce = [](VkSamplerAddressMode mode) { return mode == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE; };
-        Require(context.samplerMirrorClampToEdge || !(mirrorsOnce(descriptor.addressModeU) || mirrorsOnce(descriptor.addressModeV) || mirrorsOnce(descriptor.addressModeW)), "guest sampler descriptor uses a mirror-once clamp mode which the device does not support");
+        Require(descriptor.lodBias >= -context.limits.maxSamplerLodBias && descriptor.lodBias <= context.limits.maxSamplerLodBias, "guest sampler descriptor requests a LOD bias beyond the device limit");
         Require(!(descriptor.unnormalizedCoordinates && descriptor.compareEnable), "guest sampler descriptor with unnormalized coordinates enables depth comparison, which is not implemented");
         if (descriptor.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT) {
             Require(context.samplerFilterMinmax, "guest sampler descriptor uses a min or max reduction which the device does not support");
@@ -28,7 +21,6 @@ namespace AgcDriver::Graphics {
     Sampler::Sampler(const Context& context, const GuestSamplerResource& descriptor) : context(context) {
         Validate(context, descriptor);
         forcesDegamma = descriptor.forceDegamma;
-        disablesDegamma = descriptor.disableDegamma;
 
         VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         VkSamplerReductionModeCreateInfoEXT reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT, nullptr, descriptor.reductionMode};
@@ -42,7 +34,7 @@ namespace AgcDriver::Graphics {
         info.addressModeU = descriptor.addressModeU;
         info.addressModeV = descriptor.addressModeV;
         info.addressModeW = descriptor.addressModeW;
-        info.mipLodBias = ShaderAppliesLodBias(descriptor) ? 0.0f : descriptor.lodBias;
+        info.mipLodBias = descriptor.lodBias;
         info.anisotropyEnable = descriptor.anisotropyEnable ? VK_TRUE : VK_FALSE;
         info.maxAnisotropy = descriptor.maxAnisotropy;
         info.compareEnable = descriptor.compareEnable ? VK_TRUE : VK_FALSE;
@@ -86,9 +78,9 @@ namespace AgcDriver::Graphics {
 
     SamplerCache::SamplerCache(std::size_t capacity) : capacity(std::max<std::size_t>(capacity, 1)) {}
 
-    std::shared_ptr<Sampler> SamplerCache::Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven, bool forceDegammaPaired, bool integerBorder) {
+    std::shared_ptr<Sampler> SamplerCache::Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven, bool forceDegammaPaired, bool integerBorder, bool guardedUnnormalizedWrap) {
         Require(words.size() == 4, "guest sampler descriptor must contain 4 dwords");
-        const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], (compareEnable ? 1u : 0u) | (unnormalizedProven ? 2u : 0u) | (integerBorder ? 4u : 0u)};
+        const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], (compareEnable ? 1u : 0u) | (unnormalizedProven ? 2u : 0u) | (integerBorder ? 4u : 0u) | (ShaderRecompiler::UnnormalizedWrapEnabled() ? 8u : 0u) | (guardedUnnormalizedWrap ? 16u : 0u)};
         std::lock_guard lock(mutex);
         ++clock;
         if (const auto found = entries.find(key); found != entries.end()) {
@@ -98,7 +90,7 @@ namespace AgcDriver::Graphics {
             return found->second.sampler;
         }
         ++misses;
-        auto resource = DecodeSamplerResource(words, unnormalizedProven, forceDegammaPaired, integerBorder);
+        auto resource = DecodeSamplerResource(words, unnormalizedProven, forceDegammaPaired, integerBorder, guardedUnnormalizedWrap);
         resource.compareEnable = compareEnable;
         auto sampler = std::make_shared<Sampler>(context, resource);
         // The cap keeps live samplers well below the device's limit (NVIDIA: ~4000); a set in flight
@@ -111,10 +103,10 @@ namespace AgcDriver::Graphics {
         return sampler;
     }
 
-    void RequireFilterMinmax(const Context& context, VkFormat format, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+    void RequireFilterMinmax(const Context& context, VkFormat format, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         bool filtered = false;
-        for (auto mask = samplerMask; mask != 0u; mask &= mask - 1u) {
-            const auto element = static_cast<std::uint32_t>(std::countr_zero(mask));
+        for (std::uint32_t element = 0; element < 32u; ++element) {
+            if (((samplerMask >> element) & 1u) == 0u) continue;
             if (element >= samplers.size()) Require(false, "a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
             filtered = filtered || samplers[element]->RequiresFilterMinmax();
         }
@@ -127,49 +119,34 @@ namespace AgcDriver::Graphics {
     bool Sampler::ForcesDegamma() const {
         return forcesDegamma;
     }
-    bool Sampler::DisablesDegamma() const {
-        return disablesDegamma;
-    }
-
 
     bool Sampler::RequiresNonSeamlessCube() const {
         return requiresNonSeamlessCube;
     }
 
-    bool ForcesDegammaOn(std::uint32_t guestFormat, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+    bool ForcesDegammaOn(std::uint32_t guestFormat, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         if (IsSrgbTextureFormat(guestFormat) || IgnoresForcedDegamma(guestFormat)) return false;
-        for (auto mask = samplerMask; mask != 0u; mask &= mask - 1u) {
-            const auto element = static_cast<std::uint32_t>(std::countr_zero(mask));
-            if (element < samplers.size() && samplers[element]->ForcesDegamma()) return true;
+        for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
+            if (((samplerMask >> element) & 1u) != 0u && samplers[element]->ForcesDegamma()) return true;
         }
         return false;
     }
 
-    void RequireBorderSwizzle(std::uint32_t bcSwizzle, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+    void RequireBorderSwizzle(std::uint32_t bcSwizzle, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         constexpr std::uint32_t BcSwizzleXyzw = 0u;
         constexpr std::uint32_t BcSwizzleZyxw = 4u;
         if (bcSwizzle == BcSwizzleXyzw || bcSwizzle == BcSwizzleZyxw) return;
-        for (auto mask = samplerMask; mask != 0u; mask &= mask - 1u) {
-            const auto element = static_cast<std::uint32_t>(std::countr_zero(mask));
+        for (std::uint32_t element = 0; element < 32u; ++element) {
+            if (((samplerMask >> element) & 1u) == 0u) continue;
             if (element >= samplers.size()) Require(false, "a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
             if (samplers[element]->ReadsOpaqueBlackBorder()) Require(false, "a sampled texture whose BC swizzle " + std::to_string(bcSwizzle) + " moves the alpha channel is sampled through an opaque black border, which is not implemented");
         }
     }
 
-    void RequireNonSeamlessCube(bool cube, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+    void RequireNonSeamlessCube(bool cube, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         if (!cube) return;
-        for (auto mask = samplerMask; mask != 0u; mask &= mask - 1u) {
-            const auto element = static_cast<std::uint32_t>(std::countr_zero(mask));
-            if (element < samplers.size() && samplers[element]->RequiresNonSeamlessCube()) Require(false, "a cube texture is sampled through a sampler that disables seamless cube filtering, which needs VK_EXT_non_seamless_cube_map");
-        }
-    }
-    void RequireDisablesDegammaOn(std::uint32_t guestFormat, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
-        if (!IsSrgbTextureFormat(guestFormat)) return;
-        for (auto mask = samplerMask; mask != 0u; mask &= mask - 1u) {
-            const auto element = static_cast<std::uint32_t>(std::countr_zero(mask));
-            if (element < samplers.size() && samplers[element]->DisablesDegamma()) {
-                Require(false, "guest sampler descriptor disables degamma with an sRGB texture, which is not implemented");
-            }
+        for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
+            if (((samplerMask >> element) & 1u) != 0u && samplers[element]->RequiresNonSeamlessCube()) Require(false, "a cube texture is sampled through a sampler that disables seamless cube filtering, which needs VK_EXT_non_seamless_cube_map");
         }
     }
 

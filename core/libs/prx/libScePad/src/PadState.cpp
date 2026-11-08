@@ -3,6 +3,8 @@
 #include "prx/libScePad/include/PadHapticBuffer.hpp"
 #include "prx/libScePad/include/PadRumbleIntensity.hpp"
 #include "prx/libScePad/include/Pad.hpp"
+#include "prx/libScePad/include/PadScript.hpp"
+#include "prx/libc/include/General.hpp"
 #include "prx/libScePad/include/InputCommandFile.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
@@ -71,6 +73,8 @@ namespace {
     }();
     std::exception_ptr failure;
     bool initialized = false;
+    Pad::PadScript script;
+    std::uint32_t scriptButtons = 0;
     constexpr float kAngularVelocityDeadband = 0.017453292f;
 
     bool RefreshAudioHaptics(PadSlot& slot) {
@@ -164,6 +168,8 @@ void Pad::Initialize() {
     std::lock_guard lock(stateMutex);
     if (failure) std::rethrow_exception(failure);
     if (!initialized) {
+        script = Pad::PadScript::FromEnvironment();
+        if (!script.Empty()) APS5_LOG_OUT("[pad-script] t=%.3fs %s", Pad::ProcessSeconds(), script.Describe().c_str());
         const std::uint64_t now = sceKernelGetProcessTime();
         for (std::size_t i = 0; i < slots.size(); ++i) {
             slots[i].timestamp = now;
@@ -304,7 +310,15 @@ Pad::InputCommandFile& InjectedCommands() {
 
 Pad::InputCommandFile::Input InjectedInput(std::uint64_t now) {
     static Pad::InputCommandFile::Input lastInjected;
-    const auto injected = InjectedCommands().Poll(now);
+    const std::uint64_t scriptNow = script.Empty() ? 0 : Pad::MicrosSinceProcessStart();
+    const std::uint32_t scripted = script.Empty() ? 0 : script.Sample(scriptNow);
+    if (scripted != scriptButtons) {
+        APS5_LOG_OUT("[pad-script] t=%.3fs scripted buttons %s -> %s", static_cast<double>(scriptNow) * 1e-6,
+            Pad::ScriptButtonNames(scriptButtons).c_str(), Pad::ScriptButtonNames(scripted).c_str());
+        scriptButtons = scripted;
+    }
+    auto injected = InjectedCommands().Poll(now);
+    injected.buttons |= scripted;
     if (injected != lastInjected) {
         lastInjected = injected;
         slots[0].timestamp = now;

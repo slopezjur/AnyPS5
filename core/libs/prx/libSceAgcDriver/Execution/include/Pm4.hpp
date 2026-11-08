@@ -9,16 +9,13 @@
 #include <array>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace AgcDriver::Pm4 {
 
 constexpr std::size_t GdsBytes = 0x10000;
 std::uint64_t GdsAddress();
-void RequestImportableGds(bool requested);
-bool ImportableGdsRequested();
-bool GdsShared();
-bool GdsImportable();
-void RejectGdsImport();
+void UseGdsAt(std::uint64_t address);
 
 struct DrawParameters {
     std::uint64_t indexAddress;
@@ -81,7 +78,6 @@ struct DrawArguments {
 // path (which waits for recorded GPU work that writes them).
 DrawArguments ReadDrawArguments(const DrawParameters::IndirectDraw& indirect, std::uint32_t record);
 std::uint32_t ReadDrawCount(const DrawParameters::IndirectDraw& indirect);
-DrawArguments ReadDrawArgumentsUnsynced(const DrawParameters::IndirectDraw& indirect, std::uint32_t record);
 inline bool IndirectDrawOpcode(std::uint32_t opcode) { return opcode == 0x24 || opcode == 0x25 || opcode == 0x2c || opcode == 0x38; }
 inline bool DrawOpcode(std::uint32_t opcode) { return opcode == 0x27 || opcode == 0x2d || opcode == 0x35 || IndirectDrawOpcode(opcode); }
 
@@ -98,6 +94,8 @@ inline bool IndirectRegisterOpcode(std::uint32_t opcode) { return opcode == 0x63
 std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet);
 bool IndirectRegistersValid(std::span<const std::uint32_t> pairs);
 void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue, bool skipInvalid = false);
+std::uint32_t RegisterOffset(std::uint32_t value);
+std::optional<std::pair<std::uint32_t, std::uint32_t>> CopyDataContextRegisters(std::span<const std::uint32_t> packet);
 bool AccessesMemory(std::uint32_t header);
 // Whether an ACQUIRE_MEM packet asks only for GPU cache actions (no CPU-visible memory
 // synchronization): such a packet needs a pipeline barrier, not a device drain.
@@ -156,9 +154,7 @@ inline constexpr std::uint32_t DmaSourceData = 2;
 inline constexpr std::uint32_t DmaDestinationNowhere = 2;
 inline std::size_t DmaBytes(std::span<const std::uint32_t> packet) { return packet[6] & 0x3ffffffu; }
 inline constexpr std::uint32_t CopyDataGpuClockSource = 18;
-inline constexpr std::uint32_t CopyDataSelectGds = 6;
 inline std::uint32_t CopyDataSource(std::span<const std::uint32_t> packet) { return ((packet[1] & 0xfu) << 1u) | ((packet[1] >> 30u) & 1u); }
-inline std::uint32_t CopyDataDestination(std::span<const std::uint32_t> packet) { return ((packet[1] >> 8u) & 0xfu) << 1u; }
 inline bool CopyDataImmediate(std::uint32_t source) { return source >= 10 && source != CopyDataGpuClockSource; }
 inline bool CopyDataToRegister(std::span<const std::uint32_t> packet) { return ((packet[1] >> 8u) & 0xfu) == 0; }
 inline std::size_t CopyDataBytes(std::span<const std::uint32_t> packet) { return (packet[1] & 0x10000u) != 0 ? 8 : 4; }

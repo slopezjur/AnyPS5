@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
 
 namespace AgcDriver::Graphics {
@@ -45,6 +46,7 @@ struct DeviceLibraries {
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
     PipelineLibraryCounters counters;
+    std::set<std::pair<VkFormat, VkFormat>> depthFormats;
 };
 
 struct LibraryStore {
@@ -252,6 +254,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             }
         }
         ++device.counters.built[part];
+        if (!partsOnly && flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT && (rendering.depthAttachmentFormat != VK_FORMAT_UNDEFINED || rendering.stencilAttachmentFormat != VK_FORMAT_UNDEFINED)) device.depthFormats.emplace(rendering.depthAttachmentFormat, rendering.stencilAttachmentFormat);
         libraries.push_back(handle);
     }
     if (partsOnly) return VK_NULL_HANDLE;
@@ -260,9 +263,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     for (auto* next = static_cast<const VkBaseInStructure*>(rendering.pNext); next != nullptr; next = next->pNext) {
         if (next->sType != VK_STRUCTURE_TYPE_ATTACHMENT_SAMPLE_COUNT_INFO_NV) continue;
         const auto& counts = *reinterpret_cast<const VkAttachmentSampleCountInfoNV*>(next);
-        std::vector<VkSampleCountFlagBits> colors;
-        if (counts.colorAttachmentCount != 0) colors.assign(counts.pColorAttachmentSamples, counts.pColorAttachmentSamples + counts.colorAttachmentCount);
-        sampleCounts.emplace(std::move(colors), counts.depthStencilAttachmentSamples);
+        sampleCounts.emplace(std::vector<VkSampleCountFlagBits>(counts.pColorAttachmentSamples, counts.pColorAttachmentSamples + counts.colorAttachmentCount), counts.depthStencilAttachmentSamples);
     }
     const auto attachmentSamples = [](const std::pair<std::vector<VkSampleCountFlagBits>, VkSampleCountFlagBits>& counts) {
         return VkAttachmentSampleCountInfoNV{VK_STRUCTURE_TYPE_ATTACHMENT_SAMPLE_COUNT_INFO_NV, nullptr, static_cast<std::uint32_t>(counts.first.size()), counts.first.empty() ? nullptr : counts.first.data(), counts.second};
@@ -391,6 +392,14 @@ PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
     std::lock_guard lock(store.mutex);
     const auto found = store.devices.find(device);
     return found == store.devices.end() ? PipelineLibraryCounters{} : found->second.counters;
+}
+
+std::vector<std::pair<VkFormat, VkFormat>> PipelineLibraryDepthFormats(VkDevice device) {
+    auto& store = Libraries();
+    std::lock_guard lock(store.mutex);
+    const auto found = store.devices.find(device);
+    if (found == store.devices.end()) return {};
+    return {found->second.depthFormats.begin(), found->second.depthFormats.end()};
 }
 
 }

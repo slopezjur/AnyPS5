@@ -2,9 +2,7 @@
 #include <spirv/unified1/spirv.hpp>
 #undef SPV_ENABLE_UTILITY_CODE
 #include "SpirvBackend/SpirvSpecialization.hpp"
-#include "SpirvInstructionOperands.hpp"
 #include <algorithm>
-#include <array>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -69,9 +67,17 @@ struct ArenaAllocator {
 
 using Instruction = std::vector<std::uint32_t, ArenaAllocator<std::uint32_t>>;
 
-using SpirvInstructions::Opcode;
-using SpirvInstructions::Result;
-using SpirvInstructions::VisitIdOperands;
+spv::Op Opcode(const Instruction& instruction) {
+    return instruction.empty() ? spv::OpNop : static_cast<spv::Op>(instruction[0] & 0xffffu);
+}
+
+std::uint32_t Result(const Instruction& instruction) {
+    if (instruction.empty()) return 0u;
+    bool result = false;
+    bool type = false;
+    spv::HasResultAndType(Opcode(instruction), &result, &type);
+    return result ? instruction.at(type ? 2u : 1u) : 0u;
+}
 
 Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
     Instruction result{(static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op};
@@ -266,6 +272,209 @@ bool VisitInputs(const Instruction& instruction, const TVisitor& visit) {
     return true;
 }
 
+template<typename TVisitor>
+void VisitIdOperands(const Instruction& instruction, std::uint32_t switchLiteralWords, const TVisitor& visit) {
+    const auto size = instruction.size();
+    const auto from = [&](std::size_t first) {
+        for (auto index = first; index < size; ++index) visit(index);
+    };
+    const auto only = [&](std::initializer_list<std::size_t> indices) {
+        for (const auto index : indices) {
+            if (index < size) visit(index);
+        }
+    };
+    constexpr std::uint32_t knownMemoryAccess = static_cast<std::uint32_t>(spv::MemoryAccessVolatileMask) | static_cast<std::uint32_t>(spv::MemoryAccessAlignedMask) |
+        static_cast<std::uint32_t>(spv::MemoryAccessNontemporalMask) | static_cast<std::uint32_t>(spv::MemoryAccessMakePointerAvailableMask) |
+        static_cast<std::uint32_t>(spv::MemoryAccessMakePointerVisibleMask) | static_cast<std::uint32_t>(spv::MemoryAccessNonPrivatePointerMask);
+    const auto memoryOperands = [&](std::size_t index) {
+        while (index < size) {
+            const auto mask = instruction[index++];
+            if ((mask & ~knownMemoryAccess) != 0u) {
+                from(index);
+                return;
+            }
+            if ((mask & static_cast<std::uint32_t>(spv::MemoryAccessAlignedMask)) != 0u) ++index;
+            if ((mask & static_cast<std::uint32_t>(spv::MemoryAccessMakePointerAvailableMask)) != 0u && index < size) visit(index++);
+            if ((mask & static_cast<std::uint32_t>(spv::MemoryAccessMakePointerVisibleMask)) != 0u && index < size) visit(index++);
+        }
+    };
+    switch (Opcode(instruction)) {
+    case spv::OpNop:
+    case spv::OpCapability:
+    case spv::OpExtension:
+    case spv::OpExtInstImport:
+    case spv::OpMemoryModel:
+    case spv::OpSource:
+    case spv::OpSourceContinued:
+    case spv::OpSourceExtension:
+    case spv::OpString:
+    case spv::OpName:
+    case spv::OpMemberName:
+    case spv::OpModuleProcessed:
+    case spv::OpDecorate:
+    case spv::OpMemberDecorate:
+    case spv::OpDecorateString:
+    case spv::OpMemberDecorateString:
+    case spv::OpTypeVoid:
+    case spv::OpTypeBool:
+    case spv::OpTypeInt:
+    case spv::OpTypeFloat:
+    case spv::OpTypeSampler:
+    case spv::OpConstantTrue:
+    case spv::OpConstantFalse:
+    case spv::OpConstant:
+    case spv::OpConstantSampler:
+    case spv::OpConstantNull:
+    case spv::OpSpecConstantTrue:
+    case spv::OpSpecConstantFalse:
+    case spv::OpSpecConstant:
+    case spv::OpLabel:
+    case spv::OpNoLine:
+    case spv::OpReturn:
+    case spv::OpUnreachable:
+    case spv::OpKill:
+    case spv::OpFunctionEnd:
+        return;
+    case spv::OpTypeVector:
+    case spv::OpTypeMatrix:
+    case spv::OpTypeImage:
+        only({2});
+        return;
+    case spv::OpTypePointer:
+        only({3});
+        return;
+    case spv::OpTypeForwardPointer:
+    case spv::OpExecutionMode:
+    case spv::OpLine:
+    case spv::OpSelectionMerge:
+        only({1});
+        return;
+    case spv::OpSpecConstantOp:
+        only({1});
+        from(4);
+        return;
+    case spv::OpVariable:
+    case spv::OpFunction:
+        only({1, 4});
+        return;
+    case spv::OpLoad:
+        only({1, 3});
+        memoryOperands(4);
+        return;
+    case spv::OpStore:
+    case spv::OpCopyMemory:
+        only({1, 2});
+        memoryOperands(3);
+        return;
+    case spv::OpCopyMemorySized:
+        only({1, 2, 3});
+        memoryOperands(4);
+        return;
+    case spv::OpArrayLength:
+    case spv::OpCompositeExtract:
+        only({1, 3});
+        return;
+    case spv::OpCompositeInsert:
+    case spv::OpVectorShuffle:
+        only({1, 3, 4});
+        return;
+    case spv::OpExtInst:
+        only({1, 3});
+        from(5);
+        return;
+    case spv::OpEntryPoint: {
+        only({2});
+        std::size_t index = 3;
+        while (index < size) {
+            const auto word = instruction[index++];
+            if ((word & 0xffu) == 0u || (word & 0xff00u) == 0u || (word & 0xff0000u) == 0u || (word & 0xff000000u) == 0u) break;
+        }
+        from(index);
+        return;
+    }
+    case spv::OpExecutionModeId:
+    case spv::OpDecorateId:
+        only({1});
+        from(3);
+        return;
+    case spv::OpLoopMerge:
+        only({1, 2});
+        return;
+    case spv::OpBranchConditional:
+        only({1, 2, 3});
+        return;
+    case spv::OpSwitch:
+        only({1, 2});
+        for (std::size_t index = 3; index + switchLiteralWords < size; index += switchLiteralWords + 1u) visit(index + switchLiteralWords);
+        return;
+    case spv::OpImageSampleImplicitLod:
+    case spv::OpImageSampleExplicitLod:
+    case spv::OpImageSampleProjImplicitLod:
+    case spv::OpImageSampleProjExplicitLod:
+    case spv::OpImageFetch:
+    case spv::OpImageRead:
+    case spv::OpImageSparseSampleImplicitLod:
+    case spv::OpImageSparseSampleExplicitLod:
+    case spv::OpImageSparseSampleProjImplicitLod:
+    case spv::OpImageSparseSampleProjExplicitLod:
+    case spv::OpImageSparseFetch:
+    case spv::OpImageSparseRead:
+        only({1, 3, 4});
+        from(6);
+        return;
+    case spv::OpImageSampleDrefImplicitLod:
+    case spv::OpImageSampleDrefExplicitLod:
+    case spv::OpImageSampleProjDrefImplicitLod:
+    case spv::OpImageSampleProjDrefExplicitLod:
+    case spv::OpImageGather:
+    case spv::OpImageDrefGather:
+    case spv::OpImageSparseSampleDrefImplicitLod:
+    case spv::OpImageSparseSampleDrefExplicitLod:
+    case spv::OpImageSparseSampleProjDrefImplicitLod:
+    case spv::OpImageSparseSampleProjDrefExplicitLod:
+    case spv::OpImageSparseGather:
+    case spv::OpImageSparseDrefGather:
+        only({1, 3, 4, 5});
+        from(7);
+        return;
+    case spv::OpImageWrite:
+        only({1, 2, 3});
+        from(5);
+        return;
+    case spv::OpGroupIAdd:
+    case spv::OpGroupFAdd:
+    case spv::OpGroupFMin:
+    case spv::OpGroupUMin:
+    case spv::OpGroupSMin:
+    case spv::OpGroupFMax:
+    case spv::OpGroupUMax:
+    case spv::OpGroupSMax:
+    case spv::OpGroupNonUniformBallotBitCount:
+    case spv::OpGroupNonUniformIAdd:
+    case spv::OpGroupNonUniformFAdd:
+    case spv::OpGroupNonUniformIMul:
+    case spv::OpGroupNonUniformFMul:
+    case spv::OpGroupNonUniformSMin:
+    case spv::OpGroupNonUniformUMin:
+    case spv::OpGroupNonUniformFMin:
+    case spv::OpGroupNonUniformSMax:
+    case spv::OpGroupNonUniformUMax:
+    case spv::OpGroupNonUniformFMax:
+    case spv::OpGroupNonUniformBitwiseAnd:
+    case spv::OpGroupNonUniformBitwiseOr:
+    case spv::OpGroupNonUniformBitwiseXor:
+    case spv::OpGroupNonUniformLogicalAnd:
+    case spv::OpGroupNonUniformLogicalOr:
+    case spv::OpGroupNonUniformLogicalXor:
+        only({1, 3});
+        from(5);
+        return;
+    default:
+        from(1);
+        return;
+    }
+}
+
 struct ScalarType {
     std::uint32_t width;
     bool boolean;
@@ -370,7 +579,6 @@ public:
         resultTypes.Reset(bound);
         vectorTypes.Reset(bound);
         removed.Reset(bound);
-        decoratedResults.Reset(bound);
         aliases.Reset(bound);
         composites.Reset(bound);
         privateTables.Reset(bound);
@@ -384,8 +592,6 @@ public:
             bool hasType = false;
             spv::HasResultAndType(op, &hasResult, &hasType);
             if (hasResult && hasType) resultTypes.emplace(instruction.at(2), instruction.at(1));
-            if (op == spv::OpDecorate || op == spv::OpDecorateId || op == spv::OpDecorateString) decoratedResults.insert(instruction.at(1));
-            if (op == spv::OpGroupDecorate) for (std::size_t index = 2; index < instruction.size(); ++index) decoratedResults.insert(instruction[index]);
             if (op == spv::OpTypeBool) types.emplace(instruction.at(1), ScalarType{1u, true});
             if (op == spv::OpTypeInt) types.emplace(instruction.at(1), ScalarType{instruction.at(2), false});
             if (op == spv::OpTypeVector) vectorTypes.insert(instruction.at(1));
@@ -425,6 +631,7 @@ public:
             changed |= prune();
             changed |= propagateCopies();
         }
+        removeDeadFunctions();
         shareConstants();
         removeDeadComputations();
         removeUnreachableBlocks();
@@ -460,6 +667,7 @@ private:
         if (instruction.size() < 4u) return std::nullopt;
         const auto* type = types.find(instruction[1]);
         if (type == nullptr || type->width > 32u) return std::nullopt;
+        if (op == spv::OpIMul && instruction.size() == 5u && (value(instruction[3]) == 0u || value(instruction[4]) == 0u)) return 0u;
         if (op == spv::OpLoad && instruction.size() == 4u) {
             const auto* pointer = constPointers.find(instruction[3]);
             if (pointer == nullptr) return std::nullopt;
@@ -514,17 +722,11 @@ private:
         extracts.Reset(bound);
         IdTable<std::uint32_t> bitcasts;
         bitcasts.Reset(bound);
-        std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> blockBitcasts;
-        std::map<std::array<std::uint32_t, 3>, std::uint32_t> blockNanTests;
         IdTable<std::pair<std::uint32_t, std::uint32_t>> constPointers;
         constPointers.Reset(bound);
         for (auto& instruction : instructions) {
             if (instruction.empty()) continue;
             auto op = Opcode(instruction);
-            if (op == spv::OpFunction || op == spv::OpLabel) {
-                blockBitcasts.clear();
-                blockNanTests.clear();
-            }
             if (op == spv::OpFunction) function = true;
             if (op == spv::OpFunctionEnd) function = false;
             if (!function) continue;
@@ -571,23 +773,7 @@ private:
                     instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], source});
                     changed = true;
                 } else {
-                    const auto [found, inserted] = decoratedResults.contains(instruction[2])
-                        ? std::pair{blockBitcasts.end(), true}
-                        : blockBitcasts.try_emplace(std::pair{instruction[1], instruction[3]}, instruction[2]);
-                    if (inserted) {
-                        bitcasts.emplace(instruction[2], instruction[3]);
-                    } else {
-                        instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
-                        changed = true;
-                    }
-                }
-            }
-            const bool nanTest = (op == spv::OpIsNan && instruction.size() == 4u) || (op == spv::OpFUnordNotEqual && instruction.size() == 5u && instruction[3] == instruction[4]);
-            if (nanTest && !decoratedResults.contains(instruction[2])) {
-                const auto [found, inserted] = blockNanTests.try_emplace(std::array<std::uint32_t, 3>{op, instruction[1], instruction[3]}, instruction[2]);
-                if (!inserted) {
-                    instruction = Make(spv::OpCopyObject, {instruction[1], instruction[2], found->second});
-                    changed = true;
+                    bitcasts.emplace(instruction[2], instruction[3]);
                 }
             }
             op = Opcode(instruction);
@@ -620,7 +806,14 @@ private:
             const auto bits = type.width == 32u ? *result : *result & ((1u << type.width) - 1u);
             values[instruction[2]] = bits;
             const auto [existing, created] = canonical.emplace(std::pair{instruction[1], bits}, instruction[2]);
-            if (!created) aliases.emplace(instruction[2], existing->second);
+            if (op == spv::OpCopyObject) {
+                const auto* source = aliases.find(instruction[3]);
+                const auto target = source != nullptr ? *source : instruction[3];
+                aliases.emplace(instruction[2], target);
+                if (created) existing->second = target;
+            } else if (!created) {
+                aliases.emplace(instruction[2], existing->second);
+            }
             constants.push_back(type.boolean ? Make(bits != 0u ? spv::OpConstantTrue : spv::OpConstantFalse, {instruction[1], instruction[2]}) : Make(spv::OpConstant, {instruction[1], instruction[2], bits}));
             instruction.clear();
             changed = true;
@@ -822,6 +1015,20 @@ private:
             removed.insert(id);
             return true;
         });
+        for (bool changed = true; changed;) {
+            changed = false;
+            const auto live = referencedIds();
+            for (auto& instruction : instructions) {
+                if (instruction.empty()) continue;
+                const auto op = Opcode(instruction);
+                if (op != spv::OpConstant && op != spv::OpConstantTrue && op != spv::OpConstantFalse && op != spv::OpConstantComposite && op != spv::OpConstantNull) continue;
+                const auto id = Result(instruction);
+                if (live.contains(id)) continue;
+                removed.insert(id);
+                instruction.clear();
+                changed = true;
+            }
+        }
     }
 
     void orderPhis() {
@@ -908,6 +1115,40 @@ private:
         return true;
     }
 
+    void removeDeadFunctions() {
+        std::map<std::uint32_t, std::vector<std::uint32_t>> calls;
+        std::vector<std::uint32_t> pending;
+        std::uint32_t function = 0;
+        for (const auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if (op == spv::OpEntryPoint) pending.push_back(instruction.at(2));
+            if (op == spv::OpFunction) function = instruction.at(2);
+            if (op == spv::OpFunctionCall) calls[function].push_back(instruction.at(3));
+            if (op == spv::OpFunctionEnd) function = 0;
+            if (op == spv::OpDecorate && instruction.at(2) == spv::DecorationLinkageAttributes) return;
+            if (op == spv::OpDecorateId || op == spv::OpGroupDecorate || op == spv::OpGroupMemberDecorate) return;
+        }
+        if (pending.empty()) return;
+        std::set<std::uint32_t> live;
+        while (!pending.empty()) {
+            const auto callee = pending.back();
+            pending.pop_back();
+            if (!live.insert(callee).second) continue;
+            if (const auto found = calls.find(callee); found != calls.end()) {
+                pending.insert(pending.end(), found->second.begin(), found->second.end());
+            }
+        }
+        for (auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) function = instruction.at(2);
+            if (function != 0 && !live.contains(function)) {
+                if (const auto result = Result(instruction)) removed.insert(result);
+                instruction.clear();
+            }
+            if (op == spv::OpFunctionEnd) function = 0;
+        }
+    }
+
     void removeDeadComputations() {
         IdTable<std::size_t> definitions;
         definitions.Reset(bound);
@@ -963,7 +1204,6 @@ private:
     IdTable<std::uint32_t> resultTypes;
     IdSet vectorTypes;
     IdSet removed;
-    IdSet decoratedResults;
     IdTable<std::uint32_t> aliases;
     IdTable<std::vector<std::uint32_t>> composites;
     IdTable<std::uint32_t> privateTables;

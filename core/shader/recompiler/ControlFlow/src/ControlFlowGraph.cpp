@@ -57,7 +57,7 @@ void rebuildPredecessors(ControlFlowGraph& graph) {
     }
     for (const auto& block : graph.blocks) {
         for (const auto successor : block.successors) {
-            graph.blocks[successor].predecessors.push_back(block.id);
+            addUnique(graph.blocks[successor].predecessors, block.id);
         }
     }
     for (auto& block : graph.blocks) {

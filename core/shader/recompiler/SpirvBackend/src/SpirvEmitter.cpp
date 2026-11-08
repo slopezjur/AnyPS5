@@ -1,11 +1,11 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitter.hpp"
-#include "SpirvBackend/SpirvSpannedUniformity.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvModuleSetup.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -126,15 +126,17 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto ballotType = TypeU32Vector(state, 4u);
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
-    EmitSubgroupBallot(state, low, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
+    const auto lowPredicate = otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate);
+    EmitSubgroupBallot(state, low, lowPredicate);
     if (otherHalf == nullptr) {
         return EmitWaveBallot(state, low);
     }
-    const auto high = state.module.AllocateId();
+    const auto highPredicate = half == 1u ? Def(predicate) : otherHalf->Def(predicate);
+    const auto high = highPredicate == lowPredicate ? low : state.module.AllocateId();
     const auto lowWord = state.module.AllocateId();
     const auto highWord = state.module.AllocateId();
     const auto ballot = state.module.AllocateId();
-    state.module.AddSubgroupBallot(ballotType, high, scope, half == 1u ? Def(predicate) : otherHalf->Def(predicate));
+    if (high != low) state.module.AddSubgroupBallot(ballotType, high, scope, highPredicate);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), lowWord, low, 0u);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), highWord, high, 0u);
     state.module.AddFunction(spv::OpCompositeConstruct, ballotType, ballot, lowWord, highWord, ConstantU32(state, 0u), ConstantU32(state, 0u));
@@ -174,8 +176,18 @@ std::uint32_t SpirvValueEmitContext::Shuffle(const IrValue& inst, std::size_t in
     const auto high = state.module.AllocateId();
     const auto inHigh = state.module.AllocateId();
     const auto value = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0u), physicalLane);
-    state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope, HalfArg(inst, index, 1u), physicalLane);
+    if (IsVectorType(inst.Argument(index)->Type())) {
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0u), physicalLane);
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope, HalfArg(inst, index, 1u), physicalLane);
+    } else {
+        const auto pairType = state.module.Type(spv::OpTypeVector, type, 2u);
+        const auto halves = state.module.AllocateId();
+        const auto shuffled = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, pairType, halves, HalfArg(inst, index, 0u), HalfArg(inst, index, 1u));
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, pairType, shuffled, scope, halves, physicalLane);
+        state.module.AddFunction(spv::OpCompositeExtract, type, low, shuffled, 0u);
+        state.module.AddFunction(spv::OpCompositeExtract, type, high, shuffled, 1u);
+    }
     state.module.AddFunction(spv::OpINotEqual, TypeBool(state), inHigh, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32u)), ConstantU32(state, 0u));
     state.module.AddFunction(spv::OpSelect, type, value, inHigh, high, low);
     return value;
@@ -263,7 +275,6 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.supportedCapabilities = target.supportedCapabilities;
     state.supportedExtensions = target.supportedExtensions;
     state.nonConstantImageOffsets = target.nonConstantImageOffsets;
-    state.shaderImageMinLod = target.shaderImageMinLod;
     state.narrowSubgroupClock = target.narrowSubgroupClock;
     state.float64DenormPreserve = target.float64DenormPreserve;
     state.depthRangeRemap = target.depthRangeRemap;
@@ -277,17 +288,19 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.meshExportedLocations = target.meshExportedLocations;
     state.meshPerVertexLocations = target.meshPerVertexLocations;
     state.float16DenormPreserve = target.float16DenormPreserve;
+    state.fusedFma = target.fusedFma;
+    state.singleWorkgroup = target.singleWorkgroup && program.Resources().stage == IrShaderStage::Compute;
     state.robustBufferAccess2 = target.robustBufferAccess2;
-    state.exactRobustLoads = target.robustBufferAccess2 && target.exactRobustLoads;
     state.float32FlushToZero = target.float32FlushToZero;
     state.waveLdsMemoryBarriers = target.waveLdsMemoryBarriers;
     state.float32DenormPreserve = target.float32DenormPreserve;
     state.fusedExactArithmetic = target.fusedExactArithmetic;
     state.deviceScopeLdsMemoryBarriers = target.deviceScopeLdsMemoryBarriers;
-    state.ldsLockFences = target.ldsLockFences;
-    state.float16WidenNans = target.float16WidenNans;
-    state.float16NarrowNans = target.float16NarrowNans;
     state.hostSubgroupSize = target.subgroupSize;
+    state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
+    const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };
+    state.bindlessWaveUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Compute && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformBallot);
+    state.bindlessQuadUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Pixel && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformQuad);
     if (target.largePixelFunctionLdsBuffer && program.Resources().stage == IrShaderStage::Pixel && state.requirements.functionLds && state.requirements.functionLdsDwords > target.pixelFunctionStorageDwords) {
         state.pixelFunctionLdsBuffer = true;
         state.requirements.subgroupLocalInvocationId = true;
@@ -298,10 +311,6 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.requirements.ldsBufferInt64Atomics = true;
     }
     const bool int64Atomics = std::ranges::find(state.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) != state.supportedCapabilities.end();
-    if (!int64Atomics && state.requirements.bufferInt64Atomics && !state.requirements.bufferInt64AtomicsExact) {
-        state.requirements.bufferInt64Atomics = false;
-        state.requirements.bufferInt64AtomicsSplit = true;
-    }
     state.requirements.bufferU64View = state.requirements.bufferInt64Atomics || (state.requirements.coherentBufferPairs && int64Atomics);
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;
@@ -330,24 +339,22 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
-    // Stopped invocations would leave the wave LDS barriers incomplete.
-    state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
-    state.meshWindowBuffer = target.meshWindowBuffer && program.Resources().stage == IrShaderStage::Mesh && program.Metadata().vectorWindowSize != 0u && state.laneCount * MeshWindowInvocations(state) * program.Metadata().vectorWindowSize <= MeshWindowSlotDwords;
+    // Stopped invocations would leave the wave LDS barriers incomplete. They also break every
+    // wave-level operation of the invocations still running: a lane mask saved in an SGPR before the
+    // stop keeps the stopped lanes' bits, and a waterfall that clears a lane only by its own ballot
+    // vote (s_ff1, v_readlane, s_andn2, s_cbranch_scc1) then never ends. Two lanes per invocation
+    // also stop a lane that did not fault. So only programs whose invocations never look at each
+    // other stop; the others continue with the faulting read's zero, the fault still reported.
+    const bool waveOperations = state.laneCount != 1u || state.requirements.subgroupBallot || state.requirements.subgroupShuffle;
+    state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && !waveOperations && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
-    auto words = state.module.Finalize();
-    if (state.spannedWave) {
-        if (auto reason = SpannedBarrierInDivergentFlow(words)) throw SpannedWaveUnsupported(*reason);
-    }
     if (info != nullptr) {
         info->fullSubgroups = state.spannedWave;
         info->functionLdsBuffer = state.pixelFunctionLdsBuffer;
-        info->meshWindowBuffer = state.meshWindowBuffer;
-        info->scratchPoolSlotDwords = ScratchPoolActive(state) ? ScratchPoolSlotDwords(state) : 0u;
     }
-    VerifyScratchPoolReturns(state, words);
-    return words;
+    return state.module.Finalize();
 }
 
 }

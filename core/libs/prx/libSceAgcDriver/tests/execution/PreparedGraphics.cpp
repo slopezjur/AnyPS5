@@ -1,8 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "DepthFastClearHarness.hpp"
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -84,8 +86,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
     fragment.Initialize(1u);
     const std::array<std::uint32_t, 7> pixelCode{0xc8020002u, 0xc8060102u, 0xc80a0202u, 0xc80e0302u, 0xf800180fu, 0x03020100u, 0xbf810000u};
     fragment.snapshot->code.resize(64);
-    auto& fragmentCode = fragment.snapshot->code.Mutable();
-    fragmentCode.insert(fragmentCode.end(), pixelCode.begin(), pixelCode.end());
+    fragment.snapshot->code.insert(fragment.snapshot->code.end(), pixelCode.begin(), pixelCode.end());
     ShaderRegistry registry;
     for (const auto* fixture : {&front, &back, &domain, &fragment}) registry.emplace(fixture->snapshot->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{fixture->snapshot});
     AgcDriver::QueueState queue{};
@@ -150,13 +151,16 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
             Require(after.linked == before.linked, "registration modules: a prebuild linked a pipeline");
             return std::pair{after.built[1] - before.built[1], after.built[2] - before.built[2]};
         };
-        Require(stages.front().registration == nullptr && !GetPreparedArtifact(*stages.front().entry.handle).registrationModule, "registration modules: the vertex stage was prepared in registration form");
+        const auto vertexOnly = prebuild(stages, {0u});
+        Require(vertexOnly.first == 1u, "registration modules: the vertex stage alone did not build its pre-rasterization library");
         const auto pixelOnly = prebuild(stages, {1u});
         Require(pixelOnly.second == 1u, "registration modules: the pixel stage alone did not build its fragment library");
+        const auto pair = prebuild(stages, {0u, 1u});
+        Require(pair.first == 0u && pair.second == 0u, "registration modules: the pair of stages did not find the libraries prebuilt one stage at a time");
         const auto again = PrepareGraphicsStages(prepared, target);
-        Require(again.back().registration != stages.back().registration, "registration modules: the second preparation reused the first result object");
-        const auto repeated = prebuild(again, {1u});
-        Require(repeated.first == 0u && repeated.second == 0u, "registration modules: another materialization of the same stage did not find the prebuilt library");
+        Require(again.front().registration != stages.front().registration, "registration modules: the second preparation reused the first result object");
+        const auto repeated = prebuild(again, {0u, 1u});
+        Require(repeated.first == 0u && repeated.second == 0u, "registration modules: another materialization of the same stages did not find the prebuilt libraries");
     }
     for (const auto& stage : stages) stage.snapshot->prepared->entries.push_back(stage.entry);
     const auto& pixelArtifact = GetPreparedArtifact(*stages.back().entry.handle);
@@ -349,7 +353,7 @@ void PrebuildPolicyReadback(AgcDriver::VulkanDevice& device, bool disabled) {
     Require(stages.size() == 2u, "prebuild policy lost a required graphics stage");
     for (const auto& stage : stages) {
         Require(stage.entry.handle != nullptr && stage.snapshot != nullptr, "prebuild policy lost a required source handle");
-        Require(disabled || stage.stage == ShaderStage::Vertex ? stage.registration == nullptr : stage.registration != nullptr, "prebuild policy retained or skipped registration-default materialization");
+        Require(disabled ? stage.registration == nullptr : stage.registration != nullptr, "prebuild policy retained or skipped registration-default materialization");
         stage.snapshot->prepared->entries.push_back(stage.entry);
     }
     std::vector<LinkedProgram> linked;
@@ -671,6 +675,75 @@ void CheckMergedHullVertexTables(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void PrebuildStageWithoutPushConstants(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::DriverDetail;
+    if (!device.Target().registrationModules) return;
+    const auto* disabled = std::getenv("APS5_NO_LIBRARY_PREBUILD");
+    if (disabled != nullptr && std::string_view(disabled) == "1") return;
+    auto result = std::make_shared<ShaderRecompiler::RecompileResult>();
+    result->spirv = {0x07230203u, 0x00010000u, 0u, 6u, 0u, 0x00020011u, 1u, 0x0003000eu, 0u, 1u, 0x0005000fu, 4u, 4u, 0x6e69616du, 0u, 0x00030010u, 4u, 7u, 0x00020013u, 2u, 0x00030021u, 3u, 2u, 0x00050036u, 2u, 4u, 0u, 3u, 0x000200f8u, 5u, 0x000100fdu, 0x00010038u};
+    result->variantId = 0x5ca1ab1e0000feedull;
+    result->runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+    Require(result->pushConstants.empty(), "the push-constant-free test fragment shader has push constants");
+    const AgcDriver::Graphics::ShaderStages stages{AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, {}, {}};
+    const std::shared_ptr<AgcDriver::VulkanDevice> shared(&device, [](AgcDriver::VulkanDevice*) {});
+    const auto before = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+    PrebuildStageLibrary(shared, stages, ShaderRecompiler::ShaderStage::Fragment, result, AgcDriver::Graphics::PipelinePushSlotBytes);
+    AwaitLibraryPrebuilds();
+    const auto prebuilt = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+    Require(prebuilt.built[2] - before.built[2] == 1u, "the registration prebuild of a push-constant-free fragment shader did not build its fragment library");
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> drawShaders{{{ShaderRecompiler::ShaderStage::Fragment, result.get(), 0u}}};
+    Require(device.PrebuildGraphicsLibraries(stages, drawShaders), "the draw-side lookup of a push-constant-free fragment shader was not built");
+    const auto drawn = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+    Require(drawn.built[2] == prebuilt.built[2], "the draw built a fragment library the registration prebuild of a push-constant-free shader should have provided");
+}
+
+alignas(4096) std::array<float, DepthFastClearHarness::Width * DepthFastClearHarness::Height> PrebuildDepthPlane{};
+alignas(4096) std::array<std::byte, DepthFastClearHarness::Width * DepthFastClearHarness::Height> PrebuildStencilPlane{};
+alignas(256) constexpr std::array<std::uint32_t, 4> PrebuildOtherPixelCode{0x7e0002f0u, 0xf800180fu, 0x00000000u, 0xbf810000u};
+
+void PrebuildCoversRecordedDepthFormats(AgcDriver::VulkanDevice& device) {
+    namespace Harness = DepthFastClearHarness;
+    if (!device.Target().registrationModules) return;
+    const auto* disabled = std::getenv("APS5_NO_LIBRARY_PREBUILD");
+    if (disabled != nullptr && std::string_view(disabled) == "1") return;
+    if (!device.graphicsContext().graphicsPipelineLibrary) return;
+    const auto first = Harness::Compile(device);
+    auto second = first;
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.wave32 = true;
+    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
+    pixel.posX = true;
+    pixel.posY = true;
+    pixel.targetOutputMode[0] = 9;
+    pixel.targetExportMapping.fill(0xe4u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PrebuildOtherPixelCode.data()), std::as_bytes(std::span(PrebuildOtherPixelCode))}}};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PrebuildOtherPixelCode.data()), PrebuildOtherPixelCode, 0, {}},
+        {32, 0, std::vector<std::uint32_t>(4, 0u), std::nullopt, pixel, std::nullopt, pixelMemory},
+        device.Target(),
+        PixelPushLayout(first.vertexPush, device.Target())
+    };
+    request.useCache = false;
+    second.pixel = ShaderRecompiler::Recompile(request);
+    Require(second.pixel.Identity() != first.pixel.Identity(), "the second depth-format test fragment shader has the identity of the first");
+    const Harness::Surface surface{reinterpret_cast<std::uintptr_t>(PrebuildDepthPlane.data()), reinterpret_cast<std::uintptr_t>(PrebuildStencilPlane.data()), 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    const auto deviceHandle = device.Device();
+    const auto beforeFirst = AgcDriver::Graphics::PipelineLibraryCountersOf(deviceHandle);
+    Harness::Draw(device, first, surface, {});
+    const auto afterFirst = AgcDriver::Graphics::PipelineLibraryCountersOf(deviceHandle);
+    Require(afterFirst.built[2] - beforeFirst.built[2] == 1u, "the first depth-format draw did not build its fragment library");
+    const auto recorded = AgcDriver::Graphics::PipelineLibraryDepthFormats(deviceHandle);
+    Require(std::ranges::find(recorded, std::pair{VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) != recorded.end(), "the draw did not record its depth and stencil attachment formats");
+    const AgcDriver::Graphics::ShaderStages stages{AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> fragmentOnly{{{ShaderRecompiler::ShaderStage::Fragment, &second.pixel, PixelPushOffset(second.vertexPush, device.Target())}}};
+    Require(device.PrebuildGraphicsLibraries(stages, fragmentOnly), "the prebuild of the second depth-format fragment shader was refused");
+    const auto beforeSecond = AgcDriver::Graphics::PipelineLibraryCountersOf(deviceHandle);
+    Harness::Draw(device, second, surface, {});
+    const auto afterSecond = AgcDriver::Graphics::PipelineLibraryCountersOf(deviceHandle);
+    Require(afterSecond.built[2] == beforeSecond.built[2], "the draw built a fragment library the prebuild should have provided for a depth format draws use");
+}
+
 void NullPixelMatchesRegistration(AgcDriver::VulkanDevice& device) {
     using namespace AgcDriver::DriverDetail;
     Fixture front;
@@ -728,11 +801,13 @@ int main(int argc, char** argv) {
         const auto dump = argc == 2 ? std::filesystem::path(argv[1]) : std::filesystem::path{};
         RetainedPixelMatchesNullProgram(*device);
         NullPixelMatchesRegistration(*device);
+        PrebuildStageWithoutPushConstants(*device);
         Check(*device, AgcDriver::Graphics::ShaderPath::Vertex, dump);
         Check(*device, AgcDriver::Graphics::ShaderPath::Geometry, dump);
         Check(*device, AgcDriver::Graphics::ShaderPath::Tessellation, dump);
         CheckMergedHull(*device);
         CheckMergedHullVertexTables(*device);
+        PrebuildCoversRecordedDepthFormats(*device);
         std::cout << "prepared graphics ABI tests passed\n";
         return 0;
     } catch (const std::exception& error) {

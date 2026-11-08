@@ -24,7 +24,8 @@ struct Binding {
 };
 
 std::vector<std::uint32_t> shaderKey(bool dataWords, bool movable, const std::vector<Binding>& bindings) {
-    std::vector<std::uint32_t> key{dataWords ? 1u : 0u, 0u, 7u, 0u, static_cast<std::uint32_t>(bindings.size())};
+    // The header VisitContentKey writes: wrap guard, wrap enabled, data words, stage, variant lo/hi, binding count.
+    std::vector<std::uint32_t> key{0u, 0u, dataWords ? 1u : 0u, 0u, 7u, 0u, static_cast<std::uint32_t>(bindings.size())};
     for (const auto& binding : bindings) {
         const bool data = binding.role == DescriptorRole::ShaderData || binding.role == DescriptorRole::FlattenedSrt;
         for (const auto word : {0u, static_cast<std::uint32_t>(binding.role), 0u, 0u, binding.count, 0u, 0u, static_cast<std::uint32_t>(binding.words.size())}) key.push_back(word);

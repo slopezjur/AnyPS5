@@ -13,7 +13,6 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "SceTypes.hpp"
-#include "tests/TemporaryFile.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -131,7 +130,7 @@ std::string verdict(const WaitReport& report) {
 }
 
 std::pair<int, std::string> report(const std::filesystem::path& directory, bool full = false) {
-    std::FILE* output = TemporaryFile::Open();
+    std::FILE* output = std::tmpfile();
     check(output != nullptr, "cannot create a temporary file for the report");
     const auto code = AgcDriver::Pm4Analysis::Report(directory, full, output);
     std::string text;

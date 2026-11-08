@@ -7,19 +7,15 @@ namespace ShaderRecompiler {
 IrBlock::IrBlock(std::uint32_t id) : id(id) {
 }
 
-IrBlock::IrBlock(std::uint32_t id, std::shared_ptr<std::pmr::memory_resource> instructionNodes)
-    : instructionNodes(std::move(instructionNodes)), id(id), instructions(this->instructionNodes.get()) {
-}
-
 std::uint32_t IrBlock::Id() const {
     return id;
 }
 
-IrInstructionList& IrBlock::Instructions() {
+std::list<IrValue*>& IrBlock::Instructions() {
     return instructions;
 }
 
-const IrInstructionList& IrBlock::Instructions() const {
+const std::list<IrValue*>& IrBlock::Instructions() const {
     return instructions;
 }
 

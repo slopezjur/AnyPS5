@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -43,6 +44,72 @@ std::atomic<std::uint64_t> commitGeneration{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMappingObserver{nullptr};
 #endif
 std::atomic<void (*)(std::uintptr_t, std::size_t)> accessObserver{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t, bool)> mappingGuardObserver{nullptr};
+
+class MappingChange {
+public:
+    MappingChange(std::uintptr_t address, std::size_t bytes, bool releasing) {
+#ifdef _WIN32
+        auto& mappings = WindowsMappings::Get();
+        mappings.ChangeBegin();
+        counted = true;
+        if (!mappings.AccessGuardsUsed()) return;
+        mappings.BeginMappingChange();
+        bracketed = true;
+        if (mappings.AccessGuardedSubpages() == 0 || mappings.FirstAccessGuarded(address, bytes) == 0) return;
+        try {
+            if (const auto callback = mappingGuardObserver.load(std::memory_order_acquire)) callback(address, bytes, releasing);
+            mappings.DropAccessGuards(address, bytes);
+        } catch (...) {
+            mappings.EndMappingChange();
+            mappings.ChangeEnd();
+            throw;
+        }
+#else
+        static_cast<void>(address);
+        static_cast<void>(bytes);
+        static_cast<void>(releasing);
+#endif
+    }
+    ~MappingChange() {
+#ifdef _WIN32
+        if (bracketed) WindowsMappings::Get().EndMappingChange();
+        if (counted) WindowsMappings::Get().ChangeEnd();
+#endif
+    }
+    MappingChange(const MappingChange&) = delete;
+    MappingChange& operator=(const MappingChange&) = delete;
+
+private:
+    bool bracketed = false;
+    bool counted = false;
+};
+
+class HostChange {
+public:
+    HostChange() {
+#ifdef _WIN32
+        WindowsMappings::Get().ChangeBegin();
+#endif
+    }
+    ~HostChange() {
+#ifdef _WIN32
+        WindowsMappings::Get().ChangeEnd();
+#endif
+    }
+    HostChange(const HostChange&) = delete;
+    HostChange& operator=(const HostChange&) = delete;
+};
+
+void openAccessGuardsForHost(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    if (WindowsMappings::Get().AccessGuardedSubpages() == 0) return;
+    if (!WindowsMappings::Get().OpenAccessGuards(address, bytes)) throw std::runtime_error("a host access into access-guarded guest memory that no observer opened");
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
 
 void noteAccess(const void* pointer, std::size_t bytes) {
     if (const auto callback = accessObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -476,6 +543,7 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 }
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     Arena::Get().Release(pointer, bytes);
 }
 
@@ -661,6 +729,7 @@ bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS* exception) {
 }
 
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    const MappingChange change(address, bytes, false);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
@@ -675,6 +744,7 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
 
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
@@ -714,6 +784,7 @@ void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintp
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
     if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
         for (const auto& [address, size] : created) callback(address, size, generation);
@@ -723,11 +794,13 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Reset(pointer, bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
     noteAccess(pointer, bytes);
 }
@@ -742,6 +815,7 @@ void GuestArenaMapZero_nid_postfix(void* pointer, std::size_t bytes) {
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
@@ -764,19 +838,21 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false, viewProtection, sectionBytes);
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    const MappingChange change(address, bytes, false);
     return WindowsMappings::Get().MapAlias(address, bytes);
-}
-
-void* GuestArenaMapAliasForImport_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool* boundsRefused) {
-    return WindowsMappings::Get().MapAlias(address, bytes, boundsRefused);
 }
 
 void GuestArenaUnmapAlias_nid_postfix(void* alias) {
     WindowsMappings::Get().UnmapAlias(alias);
+}
+
+std::size_t GuestArenaAliasedPages_nid_postfix(std::uintptr_t* pages, std::uintptr_t* identities, std::size_t capacity, std::size_t* pageBytes) {
+    return WindowsMappings::Get().AliasedPages(pages, identities, capacity, pageBytes);
 }
 
 bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
@@ -801,6 +877,12 @@ void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::siz
 
 void GuestArenaForgetSection_nid_postfix(void* section) {
     WindowsMappings::Get().ForgetSection(section);
+}
+
+void GuestArenaSavedMemory_nid_postfix(std::uint64_t* bytes, std::uint64_t* blocks) {
+    const auto [saved, count] = WindowsMappings::Get().SavedMemory();
+    *bytes = saved;
+    *blocks = count;
 }
 
 bool GuestArenaForgetReusableSection_nid_no_patch(void* section) {
@@ -879,38 +961,130 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
 }
 #endif
 
-bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags) {
-#ifdef _WIN32
-    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
-    const auto first = address & ~std::uintptr_t{65535};
-    const auto last = (address + bytes - 1) | std::uintptr_t{65535};
-    if (last == std::numeric_limits<std::uintptr_t>::max() || !Arena::Get().Contains(reinterpret_cast<void*>(first), last + 1 - first) || Arena::Get().OverlapsHostRegion(first, last + 1 - first)) return false;
-    return WindowsMappings::Get().ArmOwned(address, bytes, words, count, flags);
-#else
-    static_cast<void>(address);
-    static_cast<void>(bytes);
-    static_cast<void>(words);
-    static_cast<void>(count);
-    static_cast<void>(flags);
-    return false;
-#endif
-}
-
-bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
-#ifdef _WIN32
-    return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count);
-#else
-    static_cast<void>(address);
-    static_cast<void>(bytes);
-    static_cast<void>(words);
-    static_cast<void>(count);
-    return false;
-#endif
-}
-
 bool GuestArenaWriteWatched_nid_postfix() {
     return Arena::Get().WriteWatched();
 }
+
+#ifdef _WIN32
+namespace {
+
+bool ownedRangeInArena(std::uintptr_t address, std::size_t bytes) {
+    constexpr std::uintptr_t block = WindowsMappings::ownedBlockBytes;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address - block) return false;
+    const auto first = address & ~(block - 1);
+    const auto stop = (address + bytes + block - 1) & ~(block - 1);
+    return Arena::Get().Contains(reinterpret_cast<const void*>(first), stop - first) && !Arena::Get().OverlapsHostRegion(first, stop - first);
+}
+
+}
+
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags) {
+    if (!ownedRangeInArena(address, bytes)) return WindowsMappings::Get().NoteOwnedRefusal(WindowsMappings::OwnedRefusal::Outside);
+    return WindowsMappings::Get().ArmOwned(address, bytes, words, count, flags);
+}
+
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count, std::uint64_t mark) {
+    return WindowsMappings::Get().OwnedUnchanged(address, bytes, words, count, mark);
+}
+
+std::uint64_t GuestArenaOwnedMark_nid_no_patch() {
+    return WindowsMappings::Get().OwnedMark();
+}
+
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
+    const auto taken = WindowsMappings::Get().TakeOwnedCounts();
+    std::array<std::uint64_t, GuestArenaOwnedCountSlots> values{taken.arms, taken.armedBlocks, taken.refused, taken.faults, taken.disowned, taken.privateBlocks, taken.unmappedBlocks, taken.partialBlocks, taken.collected, taken.taken, taken.queries, taken.dirty, taken.locked, taken.epochHeld, taken.epochQueried};
+    static_assert(15 + WindowsMappings::OwnedRefusalCount == GuestArenaOwnedCountSlots);
+    for (std::size_t i = 0; i < WindowsMappings::OwnedRefusalCount; ++i) values[15 + i] = taken.reasons[i];
+    for (std::size_t i = 0; i < count && i < values.size(); ++i) counts[i] = values[i];
+}
+
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
+    WindowsMappings::Get().EndSetProtection();
+}
+
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch() {
+    return WindowsMappings::Get().MappingLockOwner();
+}
+
+std::uint8_t GuestArenaGuardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return static_cast<std::uint8_t>(WindowsMappings::Get().GuardAccess(address, bytes));
+}
+
+void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().UnguardAccess(address, bytes);
+}
+
+void GuestArenaOpenAccessGuards_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    openAccessGuardsForHost(address, bytes);
+}
+
+bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t address) {
+    return WindowsMappings::Get().AccessGuarded(address);
+}
+
+std::size_t GuestArenaAccessGuardedSubpages_nid_no_patch() {
+    return WindowsMappings::Get().AccessGuardedSubpages();
+}
+
+void GuestArenaSetAccessGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address)) {
+    WindowsMappings::Get().SetAccessGuardObserver(callback);
+}
+
+void GuestArenaSetMappingGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address, std::size_t bytes, bool releasing)) {
+    mappingGuardObserver.store(callback, std::memory_order_release);
+}
+
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument) {
+    WindowsMappings::Get().RunUnderLock(body, argument);
+}
+#else
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*, std::size_t, unsigned) {
+    return false;
+}
+
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t, std::size_t, const std::uint64_t*, std::size_t, std::uint64_t) {
+    return false;
+}
+
+std::uint64_t GuestArenaOwnedMark_nid_no_patch() {
+    return 0;
+}
+
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) counts[i] = 0;
+}
+
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {}
+
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch() {
+    return 0;
+}
+
+std::uint8_t GuestArenaGuardAccess_nid_no_patch(std::uintptr_t, std::size_t) {
+    return 7;
+}
+
+void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t, std::size_t) {}
+
+void GuestArenaOpenAccessGuards_nid_no_patch(std::uintptr_t, std::size_t) {}
+
+bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t) {
+    return false;
+}
+
+std::size_t GuestArenaAccessGuardedSubpages_nid_no_patch() {
+    return 0;
+}
+
+void GuestArenaSetAccessGuardObserver_nid_no_patch(void (*)(std::uintptr_t)) {}
+
+void GuestArenaSetMappingGuardObserver_nid_no_patch(void (*)(std::uintptr_t, std::size_t, bool)) {}
+
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument) {
+    body(argument);
+}
+#endif
 
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
     hostWriteHook.store(hook, std::memory_order_release);
@@ -927,10 +1101,13 @@ void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t, std::si
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
+    openAccessGuardsForHost(address, bytes);
     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    const HostChange change;
+    openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -942,6 +1119,8 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 
 #ifdef _WIN32
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    const HostChange change;
+    openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
 

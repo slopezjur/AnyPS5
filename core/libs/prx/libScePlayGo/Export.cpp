@@ -49,6 +49,7 @@ struct ChunkTable {
     std::set<uint16_t> ids{0};
     bool defined = false;
     bool scenario = false;
+    bool scenarioListed = false;
 };
 
 static bool ReadPackageChunks(ChunkTable& table) {
@@ -105,12 +106,11 @@ static const ChunkTable& Chunks() {
         if (!file) {
             if (ReadPackageChunks(table)) return table;
             table.scenario = std::ifstream(ResolvePath_nid_no_patch("/app0/sce_sys/playgo-scenario.json")).good();
-            if (table.scenario) {
+            if (!table.scenario) RejectUnreadablePlayGoFiles();
+            else if (std::getenv("APS5_PLAYGO_SCENARIO_CHUNKS") != nullptr) {
                 for (uint32_t id = 1; id < PLAYGO_SCENARIO_CHUNK_COUNT; ++id) table.ids.insert(static_cast<uint16_t>(id));
-                return table;
+                table.scenarioListed = true;
             }
-            RejectUnreadablePlayGoFiles();
-            ReadExplicitChunks(table);
             return table;
         }
         table.defined = true;
@@ -150,6 +150,7 @@ static bool IsKnownChunk(uint16_t id) {
     const auto& chunks = Chunks();
     if (chunks.ids.contains(id)) return true;
     if (chunks.defined) return false;
+    if (chunks.scenario && !chunks.scenarioListed) return true;
     switch (UnlistedChunks()) {
     case UnlistedChunkAnswer::Installed: return true;
     case UnlistedChunkAnswer::Absent: return false;

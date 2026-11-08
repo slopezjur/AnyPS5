@@ -1,10 +1,12 @@
 #include "GraphicsTests.hpp"
+#include "EnvironmentGuards.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -96,9 +98,6 @@ struct SamplerCapture {
     VkSamplerCreateFlags flags = 0;
     bool anisotropyEnable = false;
     float maxAnisotropy = 0.0f;
-    VkSamplerAddressMode addressModeU = VK_SAMPLER_ADDRESS_MODE_MAX_ENUM;
-    VkSamplerAddressMode addressModeV = VK_SAMPLER_ADDRESS_MODE_MAX_ENUM;
-    VkSamplerAddressMode addressModeW = VK_SAMPLER_ADDRESS_MODE_MAX_ENUM;
 };
 SamplerCapture samplerCapture;
 
@@ -114,9 +113,6 @@ VKAPI_ATTR VkResult VKAPI_CALL captureCreateSampler(VkDevice, const VkSamplerCre
     samplerCapture.flags = info->flags;
     samplerCapture.anisotropyEnable = info->anisotropyEnable == VK_TRUE;
     samplerCapture.maxAnisotropy = info->maxAnisotropy;
-    samplerCapture.addressModeU = info->addressModeU;
-    samplerCapture.addressModeV = info->addressModeV;
-    samplerCapture.addressModeW = info->addressModeW;
     const auto* reduction = static_cast<const VkSamplerReductionModeCreateInfoEXT*>(info->pNext);
     if (reduction != nullptr && reduction->sType == VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT && reduction->pNext == nullptr) samplerCapture.reductionMode = reduction->reductionMode;
     *sampler = fakeHandle<VkSampler>(0x5a);
@@ -294,28 +290,6 @@ void RunNonSeamlessCubeTests(const Fields& base) {
     reject([&] { RequireNonSeamlessCube(true, 0b10u, unsupported); }, "disables seamless cube filtering, which needs VK_EXT_non_seamless_cube_map");
 }
 
-void RunMirrorOnceTests(const Fields& base) {
-    Context context{};
-    context.limits.maxSamplerAnisotropy = 1.0f;
-    context.deviceProc = captureProc;
-    for (const std::uint32_t clamp : {3u, 5u, 7u}) {
-        for (int axis = 0; axis < 3; ++axis) {
-            Fields mirrored = base;
-            (axis == 0 ? mirrored.clampX : axis == 1 ? mirrored.clampY : mirrored.clampZ) = clamp;
-            const auto decoded = DecodeSamplerResource(pack(mirrored));
-            context.samplerMirrorClampToEdge = false;
-            reject([&] { createSampler(context, decoded); }, "mirror-once clamp mode which the device does not support");
-            context.samplerMirrorClampToEdge = true;
-            const auto created = createSampler(context, decoded);
-            Require(created.created, "a mirror-once sampler was rejected on a device with VK_KHR_sampler_mirror_clamp_to_edge");
-            const auto mode = axis == 0 ? created.addressModeU : axis == 1 ? created.addressModeV : created.addressModeW;
-            Require(mode == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, "a mirror-once sampler was created with another address mode");
-        }
-    }
-    context.samplerMirrorClampToEdge = false;
-    Require(createSampler(context, DecodeSamplerResource(pack(base))).created, "a sampler without mirror-once modes needs VK_KHR_sampler_mirror_clamp_to_edge");
-}
-
 void RunSamplerCacheDegammaTests(const Fields& base) {
     Context context{};
     context.limits.maxSamplerAnisotropy = 1.0f;
@@ -329,6 +303,36 @@ void RunSamplerCacheDegammaTests(const Fields& base) {
     const auto paired = cache.Get(context, words, false, false, true);
     Require(paired->ForcesDegamma() && cache.Get(context, words, false, false, true) == paired && cache.Misses() == 1u, "a paired FORCE_DEGAMMA sampler must be created once and then served from the cache");
     reject([&] { cache.Get(context, words, false); }, "forces sRGB decoding");
+}
+
+void RunGuardedWrapTests() {
+    constexpr auto name = "APS5_UNNORM_WRAP_GUARD";
+    const auto* value = std::getenv(name);
+    const std::string previous = value ? value : "";
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("APS5_UNNORM_WRAP_GUARD", value ? value : "");
+#else
+        if (value) setenv("APS5_UNNORM_WRAP_GUARD", value, 1); else unsetenv("APS5_UNNORM_WRAP_GUARD");
+#endif
+        ShaderRecompiler::RefreshEnvironmentGuards();
+    };
+    struct Restore { decltype(set)& action; const char* value; ~Restore() { action(value); } } restore{set, value ? previous.c_str() : nullptr};
+    const std::array<std::uint32_t, 4> words{0x8000u, 0xfff000u, 0x05000000u, 0u};
+    Context context{};
+    context.limits.maxSamplerAnisotropy = 1.0f;
+    context.deviceProc = captureProc;
+    SamplerCache cache;
+    set("1");
+    const auto first = cache.Get(context, words, false, true, false, false, true);
+    Require(cache.Get(context, words, false, true, false, false, true) == first, "guarded sampler cache missed identical proof");
+    const auto decoded = DecodeSamplerResource(words, true, false, false, true);
+    Require(decoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && decoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "guarded point repeat was not mapped to edge clamp");
+    for (const auto clamp : {1u, 3u, 4u, 5u, 7u}) {
+        auto unsupported = words;
+        unsupported[0] |= clamp;
+        reject([&] { DecodeSamplerResource(unsupported, true, false, false, true); }, "clamp mode " + std::to_string(clamp) + " on X");
+    }
 }
 
 }
@@ -456,40 +460,31 @@ void RunGuestSamplerResourceTests() {
     unnormalizedAniso.xyMagFilter = 2;
     unnormalizedAniso.xyMinFilter = 2;
     rejectUnnormalized(unnormalizedAniso, "unnormalized coordinates with anisotropic filtering");
+    for (const std::uint32_t clamp : {1u, 3u, 4u, 5u, 7u}) {
+        Fields clampX = unnormalizedBase;
+        clampX.clampX = clamp;
+        rejectUnnormalized(clampX, "unnormalized coordinates with clamp mode " + std::to_string(clamp) + " on X");
+    }
+    for (const std::uint32_t clamp : {1u, 3u, 4u, 5u, 7u}) {
+        Fields clampY = unnormalizedBase;
+        clampY.clampY = clamp;
+        rejectUnnormalized(clampY, "unnormalized coordinates with clamp mode " + std::to_string(clamp) + " on Y");
+    }
     Fields clampZero = unnormalizedBase;
     clampZero.clampX = 0;
     clampZero.clampY = 0;
     const auto zeroDecoded = DecodeSamplerResource(pack(clampZero), true);
     requireUnnormalized(zeroDecoded, "unnormalized S# with clamp mode 0");
     Require(zeroDecoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && zeroDecoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "unnormalized clamp mode 0 must decode to clamp-to-edge");
-    for (const std::uint32_t clamp : {1u, 3u}) {
-        Fields mirrored = unnormalizedBase;
-        mirrored.clampX = clamp;
-        mirrored.clampY = clamp;
-        const auto decoded = DecodeSamplerResource(pack(mirrored), true);
-        requireUnnormalized(decoded, clamp == 1u ? "unnormalized S# with clamp mode 1" : "unnormalized S# with clamp mode 3");
-        Require(decoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && decoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "unnormalized clamp mode " + std::to_string(clamp) + " must decode to clamp-to-edge after the shader mirrors the coordinate");
-    }
     Fields unnormalizedBiased = unnormalizedBase;
     unnormalizedBiased.lodBiasRaw = 256;
     unnormalizedBiased.lodBiasSec = 8;
     const auto unnormalizedBiasedResult = DecodeSamplerResource(pack(unnormalizedBiased), true);
     requireUnnormalized(unnormalizedBiasedResult, "unnormalized S# with primary and secondary LOD bias");
     Require(unnormalizedBiasedResult.lodBias == 0.0f, "unnormalized coordinates must zero host lodBias");
-    for (const std::uint32_t filter : {0u, 1u}) {
-        Fields unnormalizedUntruncated = unnormalizedBase;
-        unnormalizedUntruncated.xyMagFilter = filter;
-        unnormalizedUntruncated.xyMinFilter = filter;
-        Fields unnormalizedTruncated = unnormalizedUntruncated;
-        unnormalizedTruncated.truncCoord = true;
-        const auto truncatedResult = DecodeSamplerResource(pack(unnormalizedTruncated), true);
-        const auto untruncatedResult = DecodeSamplerResource(pack(unnormalizedUntruncated), true);
-        requireUnnormalized(truncatedResult, "unnormalized S# with TRUNC_COORD");
-        Require(truncatedResult.magFilter == untruncatedResult.magFilter && truncatedResult.minFilter == untruncatedResult.minFilter
-                && truncatedResult.addressModeU == untruncatedResult.addressModeU && truncatedResult.addressModeV == untruncatedResult.addressModeV
-                && truncatedResult.borderColor == untruncatedResult.borderColor,
-            "TRUNC_COORD must not change the host sampler of an unnormalized S#");
-    }
+    Fields unnormalizedTruncated = unnormalizedBase;
+    unnormalizedTruncated.truncCoord = true;
+    rejectUnnormalized(unnormalizedTruncated, "unnormalized coordinates with TRUNC_COORD");
     auto truncatedBlend = pack(unnormalizedBase);
     truncatedBlend[0] |= 1u << 19u;
     reject([&] { DecodeSamplerResource(truncatedBlend, true); }, "unnormalized coordinates with MC_COORD_TRUNC");
@@ -503,6 +498,7 @@ void RunGuestSamplerResourceTests() {
     Require(forced.forceDegamma && !plain.forceDegamma, "FORCE_DEGAMMA must be decoded into forceDegamma");
     Require(forced.magFilter == plain.magFilter && forced.minFilter == plain.minFilter && forced.mipmapMode == plain.mipmapMode && forced.maxLod == plain.maxLod, "FORCE_DEGAMMA must not change the host sampler state");
     RunSamplerCacheDegammaTests(base);
+    RunGuardedWrapTests();
 
     Fields truncated = base;
     truncated.truncCoord = true;
@@ -513,14 +509,11 @@ void RunGuestSamplerResourceTests() {
     static_cast<void>(DecodeSamplerResource(pack(truncated)));
 
     RunNonSeamlessCubeTests(base);
-    RunMirrorOnceTests(base);
     RunSamplerReductionTests(base);
 
-    Fields degamma = base;
-    degamma.disableDegamma = true;
-    const auto degammaResult = DecodeSamplerResource(pack(degamma));
-    Require(degammaResult.disableDegamma && !plain.disableDegamma, "disableDegamma must be decoded into disableDegamma");
-    Require(degammaResult.magFilter == plain.magFilter && degammaResult.minFilter == plain.minFilter && degammaResult.mipmapMode == plain.mipmapMode && degammaResult.maxLod == plain.maxLod && degammaResult.minLod == plain.minLod && degammaResult.lodBias == plain.lodBias && degammaResult.anisotropyEnable == plain.anisotropyEnable && degammaResult.addressModeU == plain.addressModeU && degammaResult.addressModeV == plain.addressModeV && degammaResult.addressModeW == plain.addressModeW, "disableDegamma must not change the host sampler state");
+    Fields badDegamma = base;
+    badDegamma.disableDegamma = true;
+    rejectFields(badDegamma, "disables degamma");
 
     Fields secLodBias = base;
     secLodBias.lodBiasSec = 1;

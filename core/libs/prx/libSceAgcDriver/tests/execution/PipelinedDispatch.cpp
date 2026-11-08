@@ -4,7 +4,6 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/Shutdown.hpp"
-#include "TargetAddressWindow.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -54,22 +53,6 @@ std::uint32_t* Scratch = nullptr;
 std::uint32_t* Table = nullptr;
 std::uint32_t* TargetA = nullptr;
 std::uint32_t* TargetB = nullptr;
-
-void NewTargetPair() {
-    constexpr std::size_t regionBytes = 3u * BlockBytes;
-#ifdef _WIN32
-    auto* region = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, regionBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-    auto* region = static_cast<std::uint32_t*>(std::aligned_alloc(BlockBytes, regionBytes));
-#endif
-    if (region == nullptr) throw std::runtime_error("pipelined dispatch: cannot allocate contiguous target blocks");
-    std::memset(region, 0, regionBytes);
-    GuestAllocations::Mutation().Add(region, regionBytes, true, true, false);
-    const auto indices = AgcDriver::Tests::TargetAddressWindowPair(reinterpret_cast<std::uintptr_t>(region), BlockBytes);
-    constexpr auto wordsPerBlock = BlockBytes / sizeof(std::uint32_t);
-    TargetA = region + indices[0] * wordsPerBlock;
-    TargetB = region + indices[1] * wordsPerBlock;
-}
 
 alignas(256) constexpr std::array<std::uint32_t, 8> Code{0x34020082u, 0xe0301000u, 0x80000201u, 0xbf8c3f70u, 0x4a060481u, 0xe0701000u, 0x80010301u, 0xbf810000u};
 
@@ -159,6 +142,8 @@ int main() {
         }
         const char* dispatchSwitch = std::getenv("APS5_PIPELINE_DISPATCH");
         const bool pipelinedDispatch = dispatchSwitch != nullptr && dispatchSwitch[0] != '\0' && dispatchSwitch[0] != '0';
+        const char* missSwitch = std::getenv("APS5_PIPELINE_DISPATCH_MISSES");
+        const bool missItems = pipelinedDispatch && missSwitch != nullptr && missSwitch[0] != '\0' && missSwitch[0] != '0';
 
         Shader shader{};
         shader.file_header = 0x34333231;
@@ -186,7 +171,8 @@ int main() {
         Output = NewBlock();
         Scratch = NewBlock();
         Table = NewBlock();
-        NewTargetPair();
+        TargetA = NewBlock();
+        TargetB = NewBlock();
         check((reinterpret_cast<std::uintptr_t>(TargetA) >> 32u) == (reinterpret_cast<std::uintptr_t>(TargetB) >> 32u), "the two targets do not share their high address dword");
         const auto initialDescriptor = BufferDescriptor(TargetA, BufferBytes);
         std::copy(initialDescriptor.begin(), initialDescriptor.end(), Table);
@@ -235,6 +221,7 @@ int main() {
             } release{released};
             WaitUntil([] { return DrawPipeline::QueuedItems() == 0; }, "the pipeline to empty before descriptor round " + std::to_string(round));
             const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode);
+            const auto captureDrainsBefore = DrawPipeline::DrainRequestsByOpcode(0x100);
             DrawPipeline::Queue0().Enqueue([&released] {
                 while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }, {});
@@ -243,17 +230,17 @@ int main() {
             WaitUntil([] { return DrawPipeline::QueuedItems() >= 4; }, "the target and table fills queued behind the gate");
             auto dispatch = TableDispatch(TableCode.data());
             Submit(dispatch);
-            WaitUntil([&drainsBefore] { return DrawPipeline::QueuedItems() >= 5 || DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) > drainsBefore; }, "the dispatch handled while the table fill is pending");
+            WaitUntil([&drainsBefore, &captureDrainsBefore, missItems] { return DrawPipeline::QueuedItems() >= 5 || DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) > drainsBefore || (missItems && DrawPipeline::DrainRequestsByOpcode(0x100) > captureDrainsBefore); }, "the dispatch handled while the table fill is pending");
             released.store(true, std::memory_order_release);
             AgcDriverWaitIdle_nid_postfix();
             AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
-            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore;
+            const auto drains = DrawPipeline::DrainRequestsByOpcode(DispatchOpcode) - drainsBefore + (missItems ? DrawPipeline::DrainRequestsByOpcode(0x100) - captureDrainsBefore : 0u);
             for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
                 check(Output[lane] == value + 1u, "descriptor round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u) + " (the dispatch read the buffer the table named before the pending fill of the table)");
             }
             std::printf("pipelined dispatch: descriptor round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
             if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
-            if (pipelinedDispatch) check(drains == 1, "a dispatch whose table entry is pending a write drained " + std::to_string(drains) + " times, expected once");
+            if (pipelinedDispatch) check(missItems ? drains >= 1 : drains == 1, "a dispatch whose table entry is pending a write drained " + std::to_string(drains) + " times, expected once");
         }
         const std::array<std::uint32_t, 5> scalarValues{0x13572468u, 0x2468ace0u, 0x0f1e2d3cu, 0x9abcdef0u, 0x31415926u};
         for (std::size_t round = 0; round < scalarValues.size(); ++round) {

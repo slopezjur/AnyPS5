@@ -226,7 +226,7 @@ bool foldRedundantMask(IrValue& value) {
 
 bool feedsMultiply(const IrValue& value) {
     const auto& uses = value.Uses();
-    return std::any_of(uses.begin(), uses.end(), [](const IrValue* use) { return use->Opcode() == IrOpcode::IMul32 || (use->Opcode() == IrOpcode::BitwiseXor32 && (isImmediate(*use->Argument(0)->Resolve(), IrType::U32) || isImmediate(*use->Argument(1)->Resolve(), IrType::U32)) && feedsMultiply(*use)); });
+    return std::any_of(uses.begin(), uses.end(), [](const IrValue* use) { return use->Opcode() == IrOpcode::IMul32; });
 }
 
 bool isImmediateU32(const IrValue& value, std::uint32_t immediate) {
@@ -245,24 +245,10 @@ bool runsAllStartingLanes(const IrProgram& program, const IrBlock* target) {
     return false;
 }
 
-bool isRealLaneCondition(const IrValue& condition) {
-    if (condition.Opcode() != IrOpcode::IEqual32) return false;
-    const auto helper = [](const IrValue& value) {
-        if (value.Opcode() != IrOpcode::GetBuiltin) return false;
-        const auto& kind = resolveArg(value, 0);
-        return isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::HelperInvocation;
-    };
-    const auto& lhs = resolveArg(condition, 0);
-    const auto& rhs = resolveArg(condition, 1);
-    return (helper(lhs) && isImmediateU32(rhs, 0u)) || (helper(rhs) && isImmediateU32(lhs, 0u));
-}
-
 enum class LaneCoverage { Real, Quads };
 
-constexpr std::uint32_t StartingLaneDepth = 8u;
-
 bool holdsStartingLanes(const IrProgram& program, const IrValue& word, std::uint32_t index, LaneCoverage coverage, std::uint32_t depth = 0) {
-    if (depth > StartingLaneDepth) return false;
+    if (depth > 8u) return false;
     if (word.Opcode() == IrOpcode::BitwiseAnd32) {
         return holdsStartingLanes(program, resolveArg(word, 0), index, coverage, depth + 1u) && holdsStartingLanes(program, resolveArg(word, 1), index, coverage, depth + 1u);
     }
@@ -280,26 +266,19 @@ bool holdsStartingLanes(const IrProgram& program, const IrValue& word, std::uint
     const auto& ballot = resolveArg(word, 0);
     if (ballot.Opcode() != IrOpcode::Ballot || !runsAllStartingLanes(program, ballot.Parent())) return false;
     const auto& condition = resolveArg(ballot, 0);
-    return isImmediate(condition, IrType::U1) ? condition.ImmediateBool() : isRealLaneCondition(condition);
+    if (isImmediate(condition, IrType::U1)) return condition.ImmediateBool();
+    if (condition.Opcode() != IrOpcode::IEqual32) return false;
+    const auto helper = [](const IrValue& value) {
+        if (value.Opcode() != IrOpcode::GetBuiltin) return false;
+        const auto& kind = resolveArg(value, 0);
+        return isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::HelperInvocation;
+    };
+    const auto& lhs = resolveArg(condition, 0);
+    const auto& rhs = resolveArg(condition, 1);
+    return (helper(lhs) && isImmediateU32(rhs, 0u)) || (helper(rhs) && isImmediateU32(lhs, 0u));
 }
 
-IrValue* startingRealLaneCondition(const IrProgram& program, const IrValue& word, std::uint32_t index, std::uint32_t depth = 0u) {
-    if (depth > StartingLaneDepth) return nullptr;
-    if (word.Opcode() == IrOpcode::BitwiseAnd32) {
-        for (std::size_t side = 0u; side < 2u; ++side) {
-            auto* condition = startingRealLaneCondition(program, resolveArg(word, side), index, depth + 1u);
-            if (condition != nullptr && holdsStartingLanes(program, resolveArg(word, 1u - side), index, LaneCoverage::Real, depth + 1u)) return condition;
-        }
-        return nullptr;
-    }
-    if (word.Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediateU32(resolveArg(word, 1), index)) return nullptr;
-    const auto& ballot = resolveArg(word, 0);
-    if (ballot.Opcode() != IrOpcode::Ballot || !runsAllStartingLanes(program, ballot.Parent())) return nullptr;
-    auto& condition = resolveArg(ballot, 0);
-    return isRealLaneCondition(condition) ? &condition : nullptr;
-}
-
-bool foldStartingLaneBitTest(const IrProgram& program, IrBuilder& builder, IrValue& inst) {
+bool foldStartingQuadBitTest(const IrProgram& program, IrBuilder& builder, IrValue& inst) {
     if (program.Resources().stage != IrShaderStage::Pixel) return false;
     auto& left = resolveArg(inst, 0);
     auto& right = resolveArg(inst, 1);
@@ -321,13 +300,9 @@ bool foldStartingLaneBitTest(const IrProgram& program, IrBuilder& builder, IrVal
     } else if (program.WaveSize() != 32u) {
         return false;
     }
-    if (holdsStartingLanes(program, *low, 0u, LaneCoverage::Quads) && (high == nullptr || holdsStartingLanes(program, *high, 1u, LaneCoverage::Quads))) {
-        replaceWith(inst, builder.ConstantBool(true));
-        return true;
-    }
-    auto* condition = startingRealLaneCondition(program, *low, 0u);
-    if (condition == nullptr || (high != nullptr && startingRealLaneCondition(program, *high, 1u) != condition)) return false;
-    replaceWith(inst, *condition);
+    if (!holdsStartingLanes(program, *low, 0u, LaneCoverage::Quads)) return false;
+    if (high != nullptr && !holdsStartingLanes(program, *high, 1u, LaneCoverage::Quads)) return false;
+    replaceWith(inst, builder.ConstantBool(true));
     return true;
 }
 
@@ -765,7 +740,7 @@ bool forwardsWord(const IrUse& use) {
 
 void collectReaders(IrValue& value, std::vector<IrUse>& readers) {
     std::unordered_set<const IrValue*> visited{&value};
-    std::vector<std::pair<IrUseList, std::size_t>> pending;
+    std::vector<std::pair<std::vector<IrUse>, std::size_t>> pending;
     pending.emplace_back(value.OperandUses(), 0u);
     while (!pending.empty()) {
         auto& [uses, next] = pending.back();
@@ -819,7 +794,7 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     if (!isPackedAncillary(ancillary)) {
         return;
     }
-    const IrUseList uses = ancillary.OperandUses();
+    const std::vector<IrUse> uses = ancillary.OperandUses();
     std::vector<IrUse> direct;
     std::vector<IrUse> forwarded;
     for (const IrUse& use : uses) {
@@ -1250,7 +1225,7 @@ bool tryFoldValue(IrProgram& program, IrValue& value, OperandFacts& facts) {
             return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return std::max(a, b); });
         }
         case IrOpcode::IEqual32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a == b; }) || foldEqualityByValueSet(builder, value, true, facts);
-        case IrOpcode::INotEqual32: return foldConstantBitTest(builder, value) || foldStartingLaneBitTest(program, builder, value) || foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a != b; }) || foldEqualityByValueSet(builder, value, false, facts);
+        case IrOpcode::INotEqual32: return foldConstantBitTest(builder, value) || foldStartingQuadBitTest(program, builder, value) || foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a != b; }) || foldEqualityByValueSet(builder, value, false, facts);
         case IrOpcode::ULessThan32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a < b; }) || foldULessThanByRange(builder, value, facts);
         case IrOpcode::ULessThanEqual32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a <= b; });
         case IrOpcode::UGreaterThan32: return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) { return a > b; });

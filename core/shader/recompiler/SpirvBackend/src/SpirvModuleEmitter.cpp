@@ -1,11 +1,10 @@
+#include "SpirvBackend/SpirvImageEmitter.hpp"
 #include "SpirvBackend/SpirvModuleEmitter.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
-#include "SpirvBackend/SpirvMemory/SpirvFormatConvert.hpp"
-#include <cmath>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include "PipelineSpecialization.hpp"
@@ -244,15 +243,11 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         state.module.AddFunction(spv::OpSelect, TypeU32(state), bits, value, ConstantU32(state, 1u), ConstantU32(state, 0u));
         return bits;
     }
-    if (kind == StageInputKind::VertexIndex || kind == StageInputKind::InstanceIndex || kind == StageInputKind::BaseInstance || kind == StageInputKind::InvocationId || kind == StageInputKind::PrimitiveId || kind == StageInputKind::Layer || kind == StageInputKind::SampleId) {
+    if (kind == StageInputKind::VertexIndex || kind == StageInputKind::InstanceIndex || kind == StageInputKind::BaseInstance || kind == StageInputKind::BaseVertex || kind == StageInputKind::InvocationId || kind == StageInputKind::PrimitiveId || kind == StageInputKind::Layer || kind == StageInputKind::SampleId) {
         const auto value = state.module.AllocateId();
         const auto bits = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
         state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
-        if (kind == StageInputKind::Layer) {
-            const auto base = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MeshLayerBase, 0u);
-            return EmitBinaryU32(state, spv::OpIAdd, bits, base);
-        }
         return kind == StageInputKind::SampleId ? GuestSampleIndex(state, bits) : bits;
     }
     if (kind == StageInputKind::SampleMask) {
@@ -286,16 +281,6 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         const auto bits = state.module.AllocateId();
         state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer, variable, ConstantU32(state, component + 1u));
         state.module.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
-        if (kind == StageInputKind::BaryCoordSmooth && state.program.Metadata().barycentricBuiltinsUnnormalized) {
-            const auto fragCoordW = state.module.AllocateId();
-            state.module.AddFunction(spv::OpBitcast, TypeF32(state), fragCoordW, EmitBuiltinU32(state, StageInputKind::FragCoord, 3u));
-            const auto rasterized = state.module.AllocateId();
-            state.module.AddFunction(spv::OpFOrdGreaterThan, TypeBool(state), rasterized, fragCoordW, ConstantF32Value(state, 0.0f));
-            const auto kept = state.module.AllocateId();
-            state.module.AddFunction(spv::OpSelect, TypeF32(state), kept, rasterized, value, ConstantF32Value(state, 0.0f));
-            state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, kept);
-            return bits;
-        }
         state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
         return bits;
     }
@@ -458,7 +443,7 @@ std::uint32_t PackExport(SpirvEmitterState& state, IrBufferFormat format, std::u
     return packed;
 }
 
-std::uint32_t SelectExportPacking(SpirvEmitterState& state, std::uint32_t target, std::uint32_t color, bool half) {
+std::uint32_t SelectExportPacking(SpirvEmitterState& state, std::uint32_t target, std::uint32_t color) {
     const auto packing = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportPackingBase + target, static_cast<std::uint32_t>(ColorExportPacking::None));
     const auto unorm = EmitCompareU32Constant(state, spv::OpIEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::Unorm10_11_11));
     const auto floating = EmitCompareU32Constant(state, spv::OpIEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::Float11_11_10));
@@ -466,16 +451,10 @@ std::uint32_t SelectExportPacking(SpirvEmitterState& state, std::uint32_t target
     const auto wide = Select(state, TypeU32(state), floating, PackExport(state, IrBufferFormat::Format10_11_11Float, color), PackExport(state, IrBufferFormat::Format11_11_10UNorm, color));
     const auto word = Select(state, TypeU32(state), small, PackExport(state, IrBufferFormat::Format4_4_4_4UNorm, color), wide);
     const auto packed = Binary(state, spv::OpLogicalOr, TypeBool(state), Binary(state, spv::OpLogicalOr, TypeBool(state), unorm, floating), small);
-    const auto limit = half ? Select(state, TypeU32(state), EmitCompareU32Constant(state, spv::OpIEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::UintClamp8)), ConstantU32(state, 0xffu), Select(state, TypeU32(state), EmitCompareU32Constant(state, spv::OpIEqual, packing, static_cast<std::uint32_t>(ColorExportPacking::UintClamp16)), ConstantU32(state, 0xffffu), ConstantU32(state, 0xffffffffu))) : 0u;
     std::array<std::uint32_t, 4> components{};
     for (std::uint32_t component = 0; component < components.size(); ++component) {
-        auto unpacked = state.module.AllocateId();
+        const auto unpacked = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), unpacked, color, component);
-        if (half) {
-            const auto clamped = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, Unary(state, spv::OpBitcast, TypeU32(state), unpacked), limit);
-            unpacked = Unary(state, spv::OpBitcast, TypeF32(state), clamped);
-        }
         components[component] = Select(state, TypeF32(state), packed, component == 0u ? Unary(state, spv::OpBitcast, TypeF32(state), word) : ConstantF32(state, 0u), unpacked);
     }
     const auto result = state.module.AllocateId();
@@ -489,188 +468,31 @@ struct MergeTexel {
     std::uint32_t sample;
 };
 
-MergeTexel MergeTargetTexel(SpirvEmitterState& state, std::size_t entry) {
+MergeTexel MergeTargetTexel(SpirvEmitterState& state) {
     const auto& pixel = PixelInfo(state);
     const auto& images = state.program.Info().images;
-    const auto index = static_cast<std::size_t>(std::ranges::find_if(images, [](const ImageResource& candidate) { return candidate.targetMerge; }) - images.begin()) + entry;
-    if (index >= images.size() || !images[index].targetMerge) FailEmit("the color target merge image was not collected");
-    if (entry >= state.mergeValueVariables.size() || entry >= state.mergePendingVariables.size()) FailEmit("the color target merge variables were not declared");
-    const auto& merge = pixel.merges[entry];
-    if (InputVariableForKind(state, StageInputKind::FragCoord) == 0u || (pixel.mergeSamples > 1u && InputVariableForKind(state, StageInputKind::SampleId) == 0u) || (merge.layered && InputVariableForKind(state, StageInputKind::Layer) == 0u)) FailEmit("the color target merge inputs were not declared");
+    const auto image = std::ranges::find_if(images, [](const ImageResource& candidate) { return candidate.targetMerge; });
+    if (image == images.end()) FailEmit("the color target merge image was not collected");
+    if (InputVariableForKind(state, StageInputKind::FragCoord) == 0u || (pixel.mergeSamples > 1u && InputVariableForKind(state, StageInputKind::SampleId) == 0u)) FailEmit("the color target merge inputs were not declared");
+    if (state.mergeWordVariable == 0u || state.mergePendingVariable == 0u) FailEmit("the color target merge variables were not declared");
     const auto position = [&](std::uint32_t component) { return Unary(state, spv::OpConvertFToU, TypeU32(state), Unary(state, spv::OpBitcast, TypeF32(state), EmitBuiltinU32(state, StageInputKind::FragCoord, component))); };
     const auto x = position(0u);
     const auto y = position(1u);
     const auto coord = state.module.AllocateId();
-    if (merge.layered) {
-        const auto slice = state.module.AllocateId();
-        state.module.AddFunction(spv::OpExtInst, TypeU32(state), slice, GlslStd450(state), GLSLstd450UMin, EmitAddU32(state, EmitBuiltinU32(state, StageInputKind::Layer, 0u), ConstantU32(state, merge.firstSlice)), ConstantU32(state, merge.lastSlice));
-        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3u), coord, x, y, slice);
-    } else {
-        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), coord, x, y);
-    }
-    return {static_cast<std::uint32_t>(index), coord, pixel.mergeSamples > 1u ? EmitBuiltinU32(state, StageInputKind::SampleId, 0u) : 0u};
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), coord, x, y);
+    return {static_cast<std::uint32_t>(image - images.begin()), coord, pixel.mergeSamples > 1u ? EmitBuiltinU32(state, StageInputKind::SampleId, 0u) : 0u};
 }
 
-std::uint32_t PackedBlendFactor(SpirvEmitterState& state, std::uint32_t factor, std::uint32_t source, std::uint32_t destination, std::uint32_t sourceAlpha) {
-    const auto one = ConstantF32Value(state, 1.0f);
-    const auto minus = [&](std::uint32_t value) { return Binary(state, spv::OpFSub, TypeF32(state), one, value); };
-    switch (factor) {
-        case 1: return one;
-        case 2: return source;
-        case 3: return minus(source);
-        case 4: return sourceAlpha;
-        case 5: return minus(sourceAlpha);
-        case 6: return one;
-        case 7: return ConstantF32Value(state, 0.0f);
-        case 8: return destination;
-        case 9: return minus(destination);
-        case 10: {
-            const auto saturated = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeF32(state), saturated, GlslStd450(state), GLSLstd450FMin, sourceAlpha, ConstantF32Value(state, 0.0f));
-            return saturated;
-        }
-        default: FailEmit("a blended packed color target has an unsupported blend factor");
-    }
-}
-
-std::uint32_t PackedBlendTerm(SpirvEmitterState& state, std::uint32_t factor, std::uint32_t value, std::uint32_t source, std::uint32_t destination, std::uint32_t sourceAlpha) {
-    if (factor == 0u) return ConstantF32Value(state, 0.0f);
-    if (factor == 1u) return value;
-    return Binary(state, spv::OpFMul, TypeF32(state), value, PackedBlendFactor(state, factor, source, destination, sourceAlpha));
-}
-
-std::uint32_t BlendPackedColor(SpirvEmitterState& state, IrBufferFormat format, std::uint32_t color, std::uint32_t stored, std::uint32_t control) {
-    const auto info = GetFormatInfo(format);
-    const auto sourceFactor = control & 0x1fu;
-    const auto combine = (control >> 5u) & 7u;
-    const auto destinationFactor = (control >> 8u) & 0x1fu;
-    const auto sourceAlpha = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), sourceAlpha, color, 3u);
-    std::array<std::uint32_t, 4> components{};
-    for (std::uint32_t component = 0; component < components.size(); ++component) {
-        const auto source = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), source, color, component);
-        if (component >= info.componentCount) {
-            components[component] = source;
-            continue;
-        }
-        const auto field = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, stored, ConstantU32(state, info.componentBitOffset[component])), ConstantU32(state, (1u << info.componentBits[component]) - 1u));
-        const auto destination = Unary(state, spv::OpBitcast, TypeF32(state), NormalizeFormatComponent(state, info, component, field));
-        const auto glsl = [&](std::uint32_t op) {
-            const auto result = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state), op, source, destination);
-            return result;
-        };
-        switch (combine) {
-            case 0: components[component] = Binary(state, spv::OpFAdd, TypeF32(state), PackedBlendTerm(state, sourceFactor, source, source, destination, sourceAlpha), PackedBlendTerm(state, destinationFactor, destination, source, destination, sourceAlpha)); break;
-            case 1: components[component] = Binary(state, spv::OpFSub, TypeF32(state), PackedBlendTerm(state, sourceFactor, source, source, destination, sourceAlpha), PackedBlendTerm(state, destinationFactor, destination, source, destination, sourceAlpha)); break;
-            case 2: components[component] = glsl(GLSLstd450FMin); break;
-            case 3: components[component] = glsl(GLSLstd450FMax); break;
-            case 4: components[component] = Binary(state, spv::OpFSub, TypeF32(state), PackedBlendTerm(state, destinationFactor, destination, source, destination, sourceAlpha), PackedBlendTerm(state, sourceFactor, source, source, destination, sourceAlpha)); break;
-            default: FailEmit("a blended packed color target has an unsupported combine function");
-        }
-    }
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4u), result, components[0], components[1], components[2], components[3]);
-    return result;
-}
-
-std::uint32_t BlendComponent(SpirvEmitterState& state, std::uint32_t vector, std::uint32_t index) {
-    const auto component = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, vector, index);
-    return component;
-}
-
-std::uint32_t BlendArithmetic(SpirvEmitterState& state, spv::Op operation, std::uint32_t left, std::uint32_t right) {
-    const auto result = Binary(state, operation, TypeF32(state), left, right);
-    state.module.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
-    return result;
-}
-
-std::uint32_t BlendGlsl(SpirvEmitterState& state, GLSLstd450 operation, std::uint32_t first, std::uint32_t second) {
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state), operation, first, second);
-    return result;
-}
-
-std::uint32_t BlendFactor(SpirvEmitterState& state, const TargetBlend& blend, std::uint32_t kind, std::uint32_t channel, bool alpha, const std::array<std::uint32_t, 4>& source, const std::array<std::uint32_t, 4>& destination) {
-    const auto one = ConstantF32(state, std::bit_cast<std::uint32_t>(1.0f));
-    const auto complement = [&](std::uint32_t value) { return BlendArithmetic(state, spv::OpFSub, one, value); };
-    const std::uint32_t index = alpha ? 3u : channel;
-    switch (kind) {
-        case 0u: return ConstantF32(state, std::bit_cast<std::uint32_t>(0.0f));
-        case 1u: return one;
-        case 2u: return source[index];
-        case 3u: return complement(source[index]);
-        case 4u: return destination[index];
-        case 5u: return complement(destination[index]);
-        case 6u: return source[3];
-        case 7u: return complement(source[3]);
-        case 8u: return destination[3];
-        case 9u: return complement(destination[3]);
-        case 10u: return ConstantF32(state, blend.constants[index]);
-        case 11u: return complement(ConstantF32(state, blend.constants[index]));
-        case 12u: return ConstantF32(state, blend.constants[3]);
-        case 13u: return complement(ConstantF32(state, blend.constants[3]));
-        case 14u: return alpha ? one : BlendGlsl(state, GLSLstd450FMin, source[3], complement(destination[3]));
-        default: FailEmit("a color target blend names an unsupported blend factor");
-    }
-}
-
-std::uint32_t BlendEquation(SpirvEmitterState& state, std::uint32_t operation, std::uint32_t sourceFactor, std::uint32_t destinationFactor, std::uint32_t source, std::uint32_t destination) {
-    switch (operation) {
-        case 0u: return BlendArithmetic(state, spv::OpFAdd, BlendArithmetic(state, spv::OpFMul, source, sourceFactor), BlendArithmetic(state, spv::OpFMul, destination, destinationFactor));
-        case 1u: return BlendArithmetic(state, spv::OpFSub, BlendArithmetic(state, spv::OpFMul, source, sourceFactor), BlendArithmetic(state, spv::OpFMul, destination, destinationFactor));
-        case 2u: return BlendArithmetic(state, spv::OpFSub, BlendArithmetic(state, spv::OpFMul, destination, destinationFactor), BlendArithmetic(state, spv::OpFMul, source, sourceFactor));
-        case 3u: return BlendGlsl(state, GLSLstd450FMin, source, destination);
-        case 4u: return BlendGlsl(state, GLSLstd450FMax, source, destination);
-        default: FailEmit("a color target blend names an unsupported blend operation");
-    }
-}
-
-void MergeBlendTarget(SpirvEmitterState& state, std::size_t entry, std::uint32_t color) {
-    const auto& blend = PixelInfo(state).merges[entry].blend;
-    const auto [resource, coord, sample] = MergeTargetTexel(state, entry);
-    const auto stored = EmitStorageImageRead(state, resource, coord, sample);
-    std::array<std::uint32_t, 4> source{};
-    std::array<std::uint32_t, 4> destination{};
-    for (std::uint32_t channel = 0; channel < 4u; ++channel) {
-        source[channel] = BlendComponent(state, color, channel);
-        destination[channel] = BlendComponent(state, stored, channel);
-    }
-    const auto low = ConstantF32(state, std::bit_cast<std::uint32_t>(blend.snorm ? -1.0f : 0.0f));
-    const auto high = ConstantF32(state, std::bit_cast<std::uint32_t>(1.0f));
-    std::array<std::uint32_t, 4> result{};
-    for (std::uint32_t channel = 0; channel < 4u; ++channel) {
-        const bool alpha = channel == 3u;
-        const auto sourceFactor = BlendFactor(state, blend, alpha ? blend.alphaSource : blend.colorSource, channel, alpha, source, destination);
-        const auto destinationFactor = BlendFactor(state, blend, alpha ? blend.alphaDestination : blend.colorDestination, channel, alpha, source, destination);
-        const auto value = BlendEquation(state, alpha ? blend.alphaOperation : blend.colorOperation, sourceFactor, destinationFactor, source[channel], destination[channel]);
-        const auto clamped = state.module.AllocateId();
-        state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450NClamp, value, low, high);
-        result[channel] = ((blend.writeMask >> channel) & 1u) != 0u ? clamped : destination[channel];
-    }
-    const auto merged = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4u), merged, result[0], result[1], result[2], result[3]);
-    state.module.AddFunction(spv::OpStore, state.mergeValueVariables[entry], merged);
-    state.module.AddFunction(spv::OpStore, state.mergePendingVariables[entry], ConstantU32(state, 1u));
-}
-
-void MergeColorTarget(SpirvEmitterState& state, std::size_t entry, std::uint32_t color) {
-    const auto& merge = PixelInfo(state).merges[entry];
-    if (merge.blend.enabled) return MergeBlendTarget(state, entry, color);
-    const auto [resource, coord, sample] = MergeTargetTexel(state, entry);
+void MergeColorTarget(SpirvEmitterState& state, std::uint32_t color) {
+    const auto& pixel = PixelInfo(state);
+    const auto [resource, coord, sample] = MergeTargetTexel(state);
     const auto stored = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stored, EmitStorageImageRead(state, resource, coord, sample), 0u);
-    const bool floating = merge.packing == ColorExportPacking::Float11_11_10;
-    if (!floating && merge.packing != ColorExportPacking::Unorm4_4_4_4) FailEmit("a color target merge into an unsupported packing");
-    if (merge.blendControl != 0u && !floating) FailEmit("a blending color target merge into a target other than 11_11_10 float");
-    const auto format = floating ? IrBufferFormat::Format10_11_11Float : IrBufferFormat::Format4_4_4_4UNorm;
-    const auto word = PackExport(state, format, merge.blendControl != 0u ? BlendPackedColor(state, format, color, stored, merge.blendControl) : color);
-    const auto kept = EmitBinaryU32(state, spv::OpBitwiseAnd, stored, ConstantU32(state, ~merge.mask));
-    const auto merged = EmitOrU32(state, kept, EmitBinaryU32(state, spv::OpBitwiseAnd, word, ConstantU32(state, merge.mask)));
-    state.module.AddFunction(spv::OpStore, state.mergeValueVariables[entry], merged);
-    state.module.AddFunction(spv::OpStore, state.mergePendingVariables[entry], ConstantU32(state, 1u));
+    const auto word = PackExport(state, IrBufferFormat::Format4_4_4_4UNorm, color);
+    const auto kept = EmitBinaryU32(state, spv::OpBitwiseAnd, stored, ConstantU32(state, ~static_cast<std::uint32_t>(pixel.mergeMask)));
+    const auto merged = EmitOrU32(state, kept, EmitBinaryU32(state, spv::OpBitwiseAnd, word, ConstantU32(state, pixel.mergeMask)));
+    state.module.AddFunction(spv::OpStore, state.mergeWordVariable, merged);
+    state.module.AddFunction(spv::OpStore, state.mergePendingVariable, ConstantU32(state, 1u));
 }
 
 bool AlphaToCoverage(const SpirvEmitterState& state) {
@@ -685,22 +507,8 @@ void StoreCoverage(SpirvEmitterState& state, std::uint32_t mask) {
     state.module.AddFunction(spv::OpStore, pointer, mask);
 }
 
-void StoreCombinedCoverage(SpirvEmitterState& state, std::uint32_t coverage, std::uint32_t own, std::uint32_t other) {
-    if (own == 0u) {
-        StoreCoverage(state, coverage);
-        return;
-    }
-    state.module.AddFunction(spv::OpStore, own, coverage);
-    const auto loaded = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, TypeI32(state), loaded, other);
-    StoreCoverage(state, Binary(state, spv::OpBitwiseAnd, TypeI32(state), coverage, loaded));
-}
-
 void StoreDitheredAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
-    constexpr std::array<std::uint32_t, 8> twoSampleMasks{{
-    0x00000000u, 0x02000002u, 0x01000201u, 0x01020201u, 0x01020101u, 0x03020103u, 0x03010303u, 0x03030303u,
-    }};
-    constexpr std::array<std::uint32_t, 64> eightSampleMasks{{
+    constexpr std::array<std::uint32_t, 64> masks{{
     0x00000000u, 0x00000010u, 0x00000004u, 0x10000004u, 0x10000002u, 0x10100002u, 0x04100002u, 0x04101002u,
     0x04101001u, 0x04101011u, 0x04041011u, 0x14041011u, 0x12041011u, 0x12141011u, 0x12140411u, 0x12141411u,
     0x12141411u, 0x12141431u, 0x12141415u, 0x32141415u, 0x32121415u, 0x32321415u, 0x16321415u, 0x16323415u,
@@ -710,14 +518,12 @@ void StoreDitheredAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
     0x777d7e77u, 0x777d7ef7u, 0x777d7e7fu, 0xf77d7e7fu, 0xf7777e7fu, 0xf7f77e7fu, 0x7ff77e7fu, 0x7ff7fe7fu,
     0x7ff7fd7fu, 0x7ff7fdffu, 0x7f7ffdffu, 0xff7ffdffu, 0xff7ff7ffu, 0xfffff7ffu, 0xffff7fffu, 0xffffffffu,
     }};
-    const std::span<const std::uint32_t> masks = state.inputInfo.pixel->psDitheredAlphaSamples == 2u ? std::span<const std::uint32_t>(twoSampleMasks) : std::span<const std::uint32_t>(eightSampleMasks);
-    const auto levels = static_cast<float>(masks.size());
     const auto alpha = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), alpha, color, 3u);
     const auto positive = Select(state, TypeF32(state), Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), alpha, ConstantF32Value(state, 0.0f)), alpha, ConstantF32Value(state, 0.0f));
-    const auto bounded = Select(state, TypeF32(state), Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), positive, ConstantF32Value(state, (levels - 1.0f) / levels)), ConstantF32Value(state, (levels - 1.0f) / levels), positive);
-    const auto index = Unary(state, spv::OpConvertFToU, TypeU32(state), Binary(state, spv::OpFMul, TypeF32(state), bounded, ConstantF32Value(state, levels)));
-    std::vector<std::uint32_t> words(masks.size());
+    const auto bounded = Select(state, TypeF32(state), Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), positive, ConstantF32Value(state, 63.0f / 64.0f)), ConstantF32Value(state, 63.0f / 64.0f), positive);
+    const auto index = Unary(state, spv::OpConvertFToU, TypeU32(state), Binary(state, spv::OpFMul, TypeF32(state), bounded, ConstantF32Value(state, 64.0f)));
+    std::array<std::uint32_t, masks.size()> words{};
     for (std::size_t i = 0; i < words.size(); ++i) words[i] = ConstantU32(state, masks[i]);
     const auto array = state.module.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, static_cast<std::uint32_t>(words.size())));
     const auto table = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, array), spv::StorageClassPrivate);
@@ -737,7 +543,7 @@ void StoreDitheredAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
     const auto pixel = Binary(state, spv::OpBitwiseOr, TypeU32(state), Binary(state, spv::OpShiftLeftLogical, TypeU32(state), parity[0], ConstantU32(state, 1u)), parity[1]);
     const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pixel, ConstantU32(state, 3u));
     const auto mask = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeU32(state), packed, shift), ConstantU32(state, 255u));
-    StoreCombinedCoverage(state, Unary(state, spv::OpBitcast, TypeI32(state), mask), state.alphaCoverageVariable, state.exportedCoverageVariable);
+    StoreCoverage(state, Unary(state, spv::OpBitcast, TypeI32(state), mask));
 }
 
 void StoreAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
@@ -751,7 +557,115 @@ void StoreAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
     state.module.AddFunction(spv::OpFUnordLessThan, TypeBool(state), below, alpha, ConstantF32(state, 0x3f000000u));
     const auto mask = state.module.AllocateId();
     state.module.AddFunction(spv::OpSelect, TypeI32(state), mask, below, ConstantI32(state, 0), ConstantI32(state, -1));
-    StoreCombinedCoverage(state, mask, state.alphaCoverageVariable, state.exportedCoverageVariable);
+    StoreCoverage(state, mask);
+}
+
+std::uint32_t ExactF32(SpirvEmitterState& state, std::uint32_t opcode, std::uint32_t lhs, std::uint32_t rhs) {
+    const auto result = Binary(state, opcode, TypeF32(state), lhs, rhs);
+    state.module.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+    return result;
+}
+
+std::uint32_t ClampUnitF32(SpirvEmitterState& state, std::uint32_t value) {
+    const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), value, ConstantF32Value(state, 0.0f));
+    const auto below = Binary(state, spv::OpFOrdLessThan, TypeBool(state), value, ConstantF32Value(state, 1.0f));
+    const auto inner = Select(state, TypeF32(state), below, value, ConstantF32Value(state, 1.0f));
+    return Select(state, TypeF32(state), positive, inner, ConstantF32Value(state, 0.0f));
+}
+
+std::uint32_t UnormToNearestF32(SpirvEmitterState& state, std::uint32_t value, std::uint32_t bits) {
+    const std::uint32_t maximum = (1u << bits) - 1u;
+    const auto nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, value, 0u);
+    const auto safe = EmitSelectValueU32(state, nonzero, value, ConstantU32(state, 1u));
+    const auto msb = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, TypeU32(state), msb, GlslStd450(state), GLSLstd450FindUMsb, safe);
+    const auto aligned = EmitBinaryU32(state, spv::OpISub, ConstantU32(state, bits - 1u), msb);
+    const auto below = Binary(state, spv::OpULessThan, TypeBool(state), EmitBinaryU32(state, spv::OpShiftLeftLogical, safe, aligned), ConstantU32(state, maximum));
+    const auto exponent = EmitAddU32(state, aligned, EmitSelectValueU32(state, below, ConstantU32(state, 1u), ConstantU32(state, 0u)));
+    const auto high = EmitBinaryU32(state, spv::OpShiftLeftLogical, safe, ConstantU32(state, 20u));
+    const auto shift = EmitAddU32(state, exponent, ConstantU32(state, 3u));
+    const auto rest = EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpUMod, high, ConstantU32(state, maximum)), shift);
+    const auto quotient = EmitAddU32(state, EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpUDiv, high, ConstantU32(state, maximum)), shift), EmitBinaryU32(state, spv::OpUDiv, rest, ConstantU32(state, maximum)));
+    const auto remainder = EmitBinaryU32(state, spv::OpUMod, rest, ConstantU32(state, maximum));
+    const auto up = Binary(state, spv::OpUGreaterThan, TypeBool(state), EmitBinaryU32(state, spv::OpShiftLeftLogical, remainder, ConstantU32(state, 1u)), ConstantU32(state, maximum));
+    const auto mantissa = EmitAddU32(state, quotient, EmitSelectValueU32(state, up, ConstantU32(state, 1u), ConstantU32(state, 0u)));
+    const auto biased = EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpISub, ConstantU32(state, 127u), exponent), ConstantU32(state, 23u));
+    const auto result = EmitBinaryU32(state, spv::OpISub, EmitAddU32(state, biased, mantissa), ConstantU32(state, 0x800000u));
+    return EmitBitcastU32ToF32(state, EmitSelectValueU32(state, nonzero, result, ConstantU32(state, 0u)));
+}
+
+std::uint32_t BlendField(SpirvEmitterState& state, std::uint32_t word, std::uint32_t offset, std::uint32_t bits) {
+    return EmitAndConstant(state, EmitShiftRightConstant(state, word, offset), (1u << bits) - 1u);
+}
+
+std::uint32_t BlendFactorF32(SpirvEmitterState& state, std::uint32_t factor, std::uint32_t source, std::uint32_t alpha, std::uint32_t destination) {
+    const auto one = ConstantF32Value(state, 1.0f);
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 7> choices{{
+        {1u, one}, {2u, source}, {3u, ExactF32(state, spv::OpFSub, one, source)}, {4u, alpha}, {5u, ExactF32(state, spv::OpFSub, one, alpha)}, {8u, destination}, {9u, ExactF32(state, spv::OpFSub, one, destination)}
+    }};
+    auto result = ConstantF32Value(state, 0.0f);
+    for (const auto& [value, choice] : choices) result = Select(state, TypeF32(state), EmitCompareU32Constant(state, spv::OpIEqual, factor, value), choice, result);
+    return result;
+}
+
+void EmitBlendedTarget(SpirvEmitterState& state, std::uint32_t index, std::uint32_t blend) {
+    const auto info = GetFormatInfo(IrBufferFormat::Format11_11_10UNorm);
+    const auto sourceFactor = BlendField(state, blend, 8u, 5u);
+    const auto destinationFactor = BlendField(state, blend, 16u, 5u);
+    const auto function = BlendField(state, blend, 24u, 3u);
+    const auto writeMask = BlendField(state, blend, 28u, 3u);
+    const auto imageType = state.module.Type(spv::OpTypeImage, TypeU32(state), spv::Dim2D, 0u, 0u, 0u, 2u, spv::ImageFormatR32ui);
+    const auto image = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, imageType, image, state.blendTargetImages[index]);
+    const auto fragCoord = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeF32Vector(state, 4u), fragCoord, state.blendFragCoordVariable);
+    std::array<std::uint32_t, 2> position{};
+    for (std::uint32_t axis = 0; axis < 2u; ++axis) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, fragCoord, axis);
+        position[axis] = Unary(state, spv::OpConvertFToU, TypeU32(state), value);
+    }
+    const auto coord = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), coord, position[0], position[1]);
+    const auto texel = state.module.AllocateId();
+    state.module.AddFunction(spv::OpImageRead, TypeU32Vector(state, 4u), texel, image, coord);
+    const auto stored = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stored, texel, 0u);
+    std::uint32_t sourceVariable = 0;
+    for (const auto& binding : state.outputs) {
+        if (binding.kind == StageOutputKind::Mrt && binding.index == index) sourceVariable = binding.variableId;
+    }
+    const auto source = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeF32Vector(state, 4u), source, sourceVariable);
+    const auto component = [&](std::uint32_t lane) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, source, lane);
+        return ClampUnitF32(state, value);
+    };
+    const auto alpha = component(3u);
+    auto packed = ConstantU32(state, 0u);
+    for (std::uint32_t lane = 0; lane < info.componentCount; ++lane) {
+        const auto bits = info.componentBits[lane];
+        const auto offset = info.componentBitOffset[lane];
+        const auto original = EmitAndConstant(state, offset == 0u ? stored : EmitShiftRightConstant(state, stored, offset), (1u << bits) - 1u);
+        const auto color = component(lane);
+        const auto destination = UnormToNearestF32(state, original, bits);
+        const auto sourceTerm = ExactF32(state, spv::OpFMul, color, BlendFactorF32(state, sourceFactor, color, alpha, destination));
+        const auto destinationTerm = ExactF32(state, spv::OpFMul, destination, BlendFactorF32(state, destinationFactor, color, alpha, destination));
+        const auto added = ExactF32(state, spv::OpFAdd, sourceTerm, destinationTerm);
+        const auto subtracted = ExactF32(state, spv::OpFSub, sourceTerm, destinationTerm);
+        const auto reversed = ExactF32(state, spv::OpFSub, destinationTerm, sourceTerm);
+        const auto result = Select(state, TypeF32(state), EmitCompareU32Constant(state, spv::OpIEqual, function, 0u), added, Select(state, TypeF32(state), EmitCompareU32Constant(state, spv::OpIEqual, function, 1u), subtracted, reversed));
+        const auto resultBits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBitcast, TypeU32(state), resultBits, result);
+        const auto written = EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, lane == 0u ? writeMask : EmitShiftRightConstant(state, writeMask, lane), 1u), 0u);
+        const auto field = EmitSelectValueU32(state, written, EmitFormatStoreComponent(state, info, lane, resultBits), original);
+        packed = EmitOrU32(state, packed, offset == 0u ? field : EmitBinaryU32(state, spv::OpShiftLeftLogical, field, ConstantU32(state, offset)));
+    }
+    const auto zero = ConstantU32(state, 0u);
+    const auto word = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), word, packed, zero, zero, zero);
+    state.module.AddFunction(spv::OpImageWrite, image, coord, word);
 }
 
 std::uint32_t ExportRawComponent(SpirvValueEmitContext& ctx, std::uint32_t vector, std::uint32_t component) {
@@ -760,30 +674,11 @@ std::uint32_t ExportRawComponent(SpirvValueEmitContext& ctx, std::uint32_t vecto
     return value;
 }
 
-std::uint32_t WidenedHalfWord(SpirvEmitterState& state, std::uint32_t half) {
-    const auto u32 = TypeU32(state);
-    const auto op = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
-    const auto is = [&](std::uint32_t value, std::uint32_t constant) { return Binary(state, spv::OpIEqual, TypeBool(state), value, ConstantU32(state, constant)); };
-    const auto sign = op(spv::OpShiftLeftLogical, op(spv::OpBitwiseAnd, half, ConstantU32(state, 0x8000u)), ConstantU32(state, 16u));
-    const auto exponent = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, half, ConstantU32(state, 10u)), ConstantU32(state, 0x1fu));
-    const auto mantissa = op(spv::OpBitwiseAnd, half, ConstantU32(state, 0x3ffu));
-    const auto fraction = op(spv::OpShiftLeftLogical, mantissa, ConstantU32(state, 13u));
-    const auto normal = op(spv::OpBitwiseOr, op(spv::OpShiftLeftLogical, op(spv::OpIAdd, exponent, ConstantU32(state, 127u - 15u)), ConstantU32(state, 23u)), fraction);
-    const auto quiet = Select(state, u32, is(mantissa, 0u), ConstantU32(state, 0u), ConstantU32(state, 0x400000u));
-    const auto special = op(spv::OpBitwiseOr, op(spv::OpBitwiseOr, ConstantU32(state, 0x7f800000u), fraction), quiet);
-    const auto msb = state.module.AllocateId();
-    state.module.AddFunction(spv::OpExtInst, u32, msb, GlslStd450(state), GLSLstd450FindUMsb, op(spv::OpBitwiseOr, mantissa, ConstantU32(state, 1u)));
-    const auto subnormal = op(spv::OpBitwiseOr, op(spv::OpShiftLeftLogical, op(spv::OpIAdd, msb, ConstantU32(state, 127u - 24u)), ConstantU32(state, 23u)), op(spv::OpBitwiseAnd, op(spv::OpShiftLeftLogical, mantissa, op(spv::OpISub, ConstantU32(state, 23u), msb)), ConstantU32(state, 0x7fffffu)));
-    const auto small = Select(state, u32, is(mantissa, 0u), ConstantU32(state, 0u), subnormal);
-    return op(spv::OpBitwiseOr, sign, Select(state, u32, is(exponent, 0u), small, Select(state, u32, is(exponent, 0x1fu), special, normal)));
-}
-
 std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const ExportInfo& exp, bool uintOutput) {
     auto& state = ctx.state;
     if (exp.compr && !uintOutput) {
         const auto mode = MrtOutputMode(state, exp);
         const auto unpack = mode == 5u ? GLSLstd450UnpackUnorm2x16 : mode == 6u ? GLSLstd450UnpackSnorm2x16 : GLSLstd450UnpackHalf2x16;
-        const auto words = mode == 4u ? EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportPackingBase + exp.index, static_cast<std::uint32_t>(ColorExportPacking::None)), static_cast<std::uint32_t>(ColorExportPacking::Uint)) : 0u;
         std::array<std::uint32_t, 4> f32 {ConstantF32(state, 0u), ConstantF32(state, 0u), ConstantF32(state, 0u), ConstantF32(state, 0x3f800000u)};
         for (std::uint32_t pair = 0; pair < 2u; pair++) {
             if ((exp.en & (3u << (pair * 2u))) == 0u) {
@@ -798,11 +693,6 @@ std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const
                 if (((exp.en >> component) & 1u) != 0u) {
                     f32.at(component) = state.module.AllocateId();
                     state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), f32.at(component), unpacked, lane);
-                    if (words != 0u) {
-                        const auto half = state.module.AllocateId();
-                        state.module.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), half, packed, ConstantU32(state, lane * 16u), ConstantU32(state, 16u));
-                        f32.at(component) = Select(state, TypeF32(state), words, Unary(state, spv::OpBitcast, TypeF32(state), WidenedHalfWord(state, half)), f32.at(component));
-                    }
                 }
             }
         }
@@ -1025,9 +915,30 @@ std::uint32_t ConvertPositionToClipSpace(SpirvEmitterState& state, std::uint32_t
     return converted;
 }
 
-void FlushTargetMerge(SpirvEmitterState& state, std::size_t entry) {
+}
+
+void EmitBlendedTargets(SpirvEmitterState& state) {
+    for (std::uint32_t index = 0; index < state.blendTargetImages.size(); ++index) {
+        if (state.blendTargetImages[index] == 0u) continue;
+        const auto blend = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportBlendBase + index, 0u);
+        EmitIfCondition(state, EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, blend, 1u), 0u), [&] {
+            const auto written = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), written, state.blendTargetWritten[index]);
+            auto condition = EmitCompareU32Constant(state, spv::OpINotEqual, written, 0u);
+            if (state.pixelValidMaskVariable != 0u) {
+                const auto mask = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, TypeU32(state), mask, state.pixelValidMaskVariable);
+                condition = EmitLogicalAndBool(state, condition, EmitCompareU32Constant(state, spv::OpINotEqual, mask, 0u));
+            }
+            EmitIfCondition(state, condition, [&] { EmitBlendedTarget(state, index, blend); });
+        });
+    }
+}
+
+void FlushColorTargetMerge(SpirvEmitterState& state) {
+    if (state.mergePendingVariable == 0u) return;
     const auto pending = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, TypeU32(state), pending, state.mergePendingVariables[entry]);
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), pending, state.mergePendingVariable);
     auto write = Binary(state, spv::OpINotEqual, TypeBool(state), pending, ConstantU32(state, 0u));
     if (state.pixelValidMaskVariable != 0u) {
         const auto valid = state.module.AllocateId();
@@ -1035,25 +946,13 @@ void FlushTargetMerge(SpirvEmitterState& state, std::size_t entry) {
         write = Binary(state, spv::OpLogicalAnd, TypeBool(state), write, Binary(state, spv::OpINotEqual, TypeBool(state), valid, ConstantU32(state, 0u)));
     }
     EmitIfCondition(state, write, [&] {
-        const auto [resource, coord, sample] = MergeTargetTexel(state, entry);
-        if (PixelInfo(state).merges[entry].blend.enabled) {
-            const auto blended = state.module.AllocateId();
-            state.module.AddFunction(spv::OpLoad, TypeF32Vector(state, 4u), blended, state.mergeValueVariables[entry]);
-            EmitStorageImageWrite(state, resource, 0u, coord, blended, sample);
-            return;
-        }
+        const auto [resource, coord, sample] = MergeTargetTexel(state);
         const auto merged = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, TypeU32(state), merged, state.mergeValueVariables[entry]);
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), merged, state.mergeWordVariable);
         const auto texel = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), texel, merged, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u));
         EmitStorageImageWrite(state, resource, 0u, coord, texel, sample);
     });
-}
-
-}
-
-void FlushColorTargetMerge(SpirvEmitterState& state) {
-    for (std::size_t entry = 0; entry < state.mergePendingVariables.size(); ++entry) FlushTargetMerge(state, entry);
 }
 
 namespace {
@@ -1132,13 +1031,12 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
         return pointer;
     }
     const auto address = ctx.Arg(inst, 1);
-    const bool patch = kind == TessellationAttribute::PatchOutput || kind == TessellationAttribute::PatchInput || kind == TessellationAttribute::GeometryOutput;
+    const bool patch = kind == TessellationAttribute::PatchOutput || kind == TessellationAttribute::PatchInput;
     const bool local = kind == TessellationAttribute::LocalOutput || kind == TessellationAttribute::ControlInput;
     const auto stride = local ? state.program.Metadata().tessellationLocalStride : kind == TessellationAttribute::ControlShared ? state.program.Metadata().tessellationSharedStride : state.program.Metadata().tessellationControlStride;
     const auto type = TypePointer(state, storage, TypeU32(state));
-    const bool controlRead = kind == TessellationAttribute::ControlOutput && inst.Opcode() == IrOpcode::GetTessellationAttribute;
     const auto inPatch = [&](std::uint32_t vertex) {
-        if (kind != TessellationAttribute::ControlInput && kind != TessellationAttribute::EvaluationInput && !controlRead) return vertex;
+        if (kind != TessellationAttribute::ControlInput && kind != TessellationAttribute::EvaluationInput) return vertex;
         const auto& tess = state.inputInfo.vertex->tess;
         const auto clamped = state.module.AllocateId();
         state.module.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, vertex, ConstantU32(state, (kind == TessellationAttribute::ControlInput ? tess.inputControlPoints : tess.outputControlPoints) - 1u));
@@ -1147,7 +1045,7 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
     const bool sharedRead = kind == TessellationAttribute::ControlShared && inst.Opcode() == IrOpcode::GetTessellationAttribute;
     const auto* sum = inst.Argument(1);
     const auto* scaled = sum->Opcode() == IrOpcode::IAdd32 ? sum->Argument(0) : nullptr;
-    if ((kind == TessellationAttribute::ControlInput || sharedRead || controlRead) && scaled != nullptr && sum->Argument(1)->HasImmediate() && scaled->Opcode() == IrOpcode::IMul32 && scaled->Argument(1)->HasImmediate() && scaled->Argument(1)->ImmediateU32() == stride) {
+    if ((kind == TessellationAttribute::ControlInput || sharedRead) && scaled != nullptr && sum->Argument(1)->HasImmediate() && scaled->Opcode() == IrOpcode::IMul32 && scaled->Argument(1)->HasImmediate() && scaled->Argument(1)->ImmediateU32() == stride) {
         const auto constant = sum->Argument(1)->ImmediateU32();
         const auto vertex = inPatch(EmitBinaryU32(state, spv::OpIAdd, ctx.Arg(*scaled, 0), ConstantU32(state, constant / stride)));
         state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, ConstantU32(state, constant % stride / 16u), ConstantU32(state, constant % stride % 16u / 4u));
@@ -1162,8 +1060,8 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
             state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute, component);
             return pointer;
         }
-        const bool own = (kind == TessellationAttribute::ControlOutput && !controlRead) || (kind == TessellationAttribute::ControlShared && !sharedRead);
-        const auto controlPoint = kind == TessellationAttribute::ControlInput ? std::min(value / stride, state.inputInfo.vertex->tess.inputControlPoints - 1u) : kind == TessellationAttribute::EvaluationInput || controlRead ? std::min(value / stride, state.inputInfo.vertex->tess.outputControlPoints - 1u) : value / stride;
+        const bool own = kind == TessellationAttribute::ControlOutput || (kind == TessellationAttribute::ControlShared && !sharedRead);
+        const auto controlPoint = kind == TessellationAttribute::ControlInput ? std::min(value / stride, state.inputInfo.vertex->tess.inputControlPoints - 1u) : kind == TessellationAttribute::EvaluationInput ? std::min(value / stride, state.inputInfo.vertex->tess.outputControlPoints - 1u) : value / stride;
         state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, own ? EmitLaneId(state) : ConstantU32(state, controlPoint), attribute, component);
         return pointer;
     }
@@ -1173,7 +1071,7 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
     if (kind == TessellationAttribute::LocalOutput || patch) {
         state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute, component);
     } else {
-        const bool own = (kind == TessellationAttribute::ControlOutput && !controlRead) || (kind == TessellationAttribute::ControlShared && !sharedRead);
+        const bool own = kind == TessellationAttribute::ControlOutput || (kind == TessellationAttribute::ControlShared && !sharedRead);
         const auto vertex = own ? EmitLaneId(state) : inPatch(EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride)));
         state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute, component);
     }
@@ -1183,7 +1081,7 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
 }
 
 void DefineTessellationInterfaces(SpirvEmitterState& state) {
-    std::array<bool, 11> used {};
+    std::array<bool, 10> used {};
     for (const IrBlock* block : state.program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
             if (inst->Opcode() != IrOpcode::GetTessellationAttribute && inst->Opcode() != IrOpcode::SetTessellationAttribute) {
@@ -1213,8 +1111,6 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
             type = array(TypeF32(state), 4u);
         } else if (instance) {
             type = kind == TessellationAttribute::InstanceInput ? array(TypeU32(state), tess.inputControlPoints) : TypeU32(state);
-        } else if (kind == TessellationAttribute::GeometryOutput) {
-            type = array(TypeU32Vector(state, 4u), (tess.geometryItemDwords + 3u) / 4u);
         } else if (patch) {
             type = array(TypeU32Vector(state, 4u), (state.program.Metadata().tessellationPatchStride + 15u) / 16u);
         } else {
@@ -1393,58 +1289,6 @@ void EmitPixelEntryPoint(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpFunctionEnd);
 }
 
-namespace {
-
-std::uint32_t MeshWindowWord(SpirvEmitterState& state, std::uint32_t index) {
-    const auto pointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.meshWindowBufferVariable, ConstantU32(state, 0u), index);
-    return pointer;
-}
-
-void EmitMeshWindowClaim(SpirvEmitterState& state, std::uint32_t firstInvocation) {
-    const auto uniform = spv::MemorySemanticsUniformMemoryMask;
-    EmitIfCondition(state, firstInvocation, [&]() {
-        const auto header = state.module.AllocateId();
-        const auto body = state.module.AllocateId();
-        const auto next = state.module.AllocateId();
-        const auto merge = state.module.AllocateId();
-        state.module.AddFunction(spv::OpBranch, header);
-        EmitLabel(state, header);
-        state.module.AddFunction(spv::OpLoopMerge, merge, next, spv::LoopControlMaskNone);
-        state.module.AddFunction(spv::OpBranch, body);
-        EmitLabel(state, body);
-        const auto ticket = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAtomicIAdd, TypeU32(state), ticket, MeshWindowWord(state, ConstantU32(state, 0u)), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u));
-        const auto slot = EmitBinaryU32(state, spv::OpBitwiseAnd, ticket, ConstantU32(state, MeshWindowSlots - 1u));
-        const auto previous = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), previous, MeshWindowWord(state, EmitAddU32(state, slot, ConstantU32(state, 4u))), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsAcquireMask | uniform), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u), ConstantU32(state, 0u));
-        state.module.AddFunction(spv::OpStore, state.meshWindowSlotVariable, slot);
-        const auto claimed = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u));
-        state.module.AddFunction(spv::OpBranchConditional, claimed, merge, next);
-        EmitLabel(state, next);
-        state.module.AddFunction(spv::OpBranch, header);
-        EmitLabel(state, merge);
-    });
-    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask | uniform));
-    const auto slot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, TypeU32(state), slot, state.meshWindowSlotVariable);
-    const auto invocation = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, TypeU32(state), invocation, InputVariableForKind(state, StageInputKind::LocalInvocationIndex));
-    const auto base = EmitAddU32(state, EmitAddU32(state, EmitBinaryU32(state, spv::OpIMul, slot, ConstantU32(state, MeshWindowSlotDwords)), ConstantU32(state, MeshWindowHeaderDwords)), invocation);
-    state.module.AddFunction(spv::OpStore, state.meshWindowBaseVariable, base);
-}
-
-void EmitMeshWindowRelease(SpirvEmitterState& state, std::uint32_t firstInvocation) {
-    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask));
-    EmitIfCondition(state, firstInvocation, [&]() {
-        const auto slot = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, TypeU32(state), slot, state.meshWindowSlotVariable);
-        state.module.AddFunction(spv::OpAtomicStore, MeshWindowWord(state, EmitAddU32(state, slot, ConstantU32(state, 4u))), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask), ConstantU32(state, 0u));
-    });
-}
-
-}
-
 void EmitMeshEntryPoint(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
@@ -1468,10 +1312,8 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
             state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshAllocation, spv::StorageClassWorkgroup, TypeU32(state), ConstantU32(state, field)), ConstantU32(state, 0u));
         }
     });
-    if (state.meshWindowBuffer) EmitMeshWindowClaim(state, firstInvocation);
     state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.meshGuestFunc);
     state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
-    if (state.meshWindowBuffer) EmitMeshWindowRelease(state, firstInvocation);
     const auto& mesh = state.inputInfo.vertex->mesh;
     const auto clamp = [&](std::uint32_t value, std::uint32_t limit) {
         const auto result = state.module.AllocateId();
@@ -1565,19 +1407,7 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
                 const auto layer = MeshLoad(state, output.meshDataVariable, spv::StorageClassWorkgroup, TypeU32(state), vertex.at(state.inputInfo.vertex->mesh.provokingVertex));
                 const auto pointer = state.module.AllocateId();
                 state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeU32(state)), pointer, output.variableId, index, ConstantU32(state, 0u));
-                const auto base = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MeshLayerBase, 0u);
-                const auto count = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MeshLayerCount, 0xffffffffu);
-                const auto relative = EmitBinaryU32(state, spv::OpISub, layer, base);
-                const auto inside = state.module.AllocateId();
-                const auto outside = state.module.AllocateId();
-                const auto selected = state.module.AllocateId();
-                const auto discarded = state.module.AllocateId();
-                state.module.AddFunction(spv::OpULessThan, TypeBool(state), inside, relative, count);
-                state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), outside, inside);
-                state.module.AddFunction(spv::OpSelect, TypeU32(state), selected, inside, relative, ConstantU32(state, 0u));
-                state.module.AddFunction(spv::OpLogicalOr, TypeBool(state), discarded, culled, outside);
-                state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshCull, spv::StorageClassOutput, TypeBool(state), index), discarded);
-                state.module.AddFunction(spv::OpStore, pointer, selected);
+                state.module.AddFunction(spv::OpStore, pointer, layer);
             }
             if (emulating) {
                 const auto corners = state.module.Type(spv::OpTypeArray, TypeF32Vector(state, 4u), ConstantU32(state, 3u));
@@ -1786,10 +1616,6 @@ std::uint32_t EmitClassMaskF32(SpirvEmitterState& state, std::uint32_t value, st
 }
 
 std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
-    if (maxValue && lhs == ConstantF32(state, 0u)) {
-        const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), rhs, lhs);
-        return Select(state, TypeF32(state), positive, rhs, lhs);
-    }
     const auto lhsClass = EmitClassifyF32(state, lhs);
     const auto rhsClass = EmitClassifyF32(state, rhs);
 
@@ -1839,7 +1665,7 @@ static std::uint32_t UnpackF16BitsToF32(SpirvEmitterState& state, std::uint32_t 
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), GLSLstd450UnpackHalf2x16, bits);
     state.module.AddFunction(spv::OpCompositeExtract, f32, value, unpacked, 0u);
-    if (!nanBits || state.float16WidenNans) return value;
+    if (!nanBits) return value;
     const auto signAndPayload = Binary(state, spv::OpShiftRightArithmetic, u32, Binary(state, spv::OpShiftLeftLogical, u32, bits, ConstantU32(state, 16u)), ConstantU32(state, 3u));
     const auto nan = Unary(state, spv::OpBitcast, f32, Binary(state, spv::OpBitwiseOr, u32, signAndPayload, ConstantU32(state, 0x7f800000u)));
     return Select(state, f32, Unary(state, spv::OpIsNan, TypeBool(state), value), nan, value);
@@ -1883,19 +1709,17 @@ void EmitProgram(SpirvEmitterState& state) {
         state.pixelValidMaskVariable = state.module.AllocateId();
         state.module.AddName(state.pixelValidMaskVariable, "pixel_valid_mask_active");
     }
-    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr) {
-        for (std::size_t entry = 0; entry < state.inputInfo.pixel->merges.size(); ++entry) {
-            state.mergeValueVariables.push_back(state.module.AllocateId());
-            state.mergePendingVariables.push_back(state.module.AllocateId());
-        }
+    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->mergeMask != 0u) {
+        state.mergeWordVariable = state.module.AllocateId();
+        state.mergePendingVariable = state.module.AllocateId();
     }
     for (const IrBlock* block : program.BlockOrder()) {
         const auto label = state.module.AllocateId();
         state.labels.emplace(block, label);
     }
     DefineGetBdaPointer(state);
+    DefineBindlessFunctions(state);
     DefineDot2F32F16Function(state);
-    DefineIntegerFloat64Functions(state);
     DefineReciprocalCorrectionFunction(state);
     for (const IrBlock* block : program.BlockOrder()) {
         const bool needsScratch = std::any_of(block->Instructions().begin(), block->Instructions().end(), [](const IrValue* inst) {
@@ -1909,7 +1733,8 @@ void EmitProgram(SpirvEmitterState& state) {
             break;
         }
     }
-    if (program.Resources().stage == IrShaderStage::Pixel && state.bdaStopsInvocations && !OrderedPixelShader(state)) {
+    const bool blendable = std::any_of(state.blendTargetImages.begin(), state.blendTargetImages.end(), [](std::uint32_t image) { return image != 0u; });
+    if (program.Resources().stage == IrShaderStage::Pixel && state.bdaStopsInvocations && !OrderedPixelShader(state) && !blendable) {
         state.pixelGuestFunc = state.module.AllocateId();
         state.pixelStopFlag = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
         if (state.spirvVersion >= 0x00010400u) state.interfaceVariables.push_back(state.pixelStopFlag);
@@ -1920,10 +1745,7 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.requirements.functionLds && !state.pixelFunctionLdsBuffer) {
         state.module.AddFunction(spv::OpVariable, TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsStorageDwords(state)), state.ldsVariable, spv::StorageClassFunction);
     }
-    if (ScratchPoolActive(state)) {
-        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.scratchPoolCandidateVariable, spv::StorageClassFunction);
-        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.scratchPoolWonVariable, spv::StorageClassFunction);
-    } else if (state.requirements.functionScratch) {
+    if (state.requirements.functionScratch) {
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
             state.module.AddFunction(spv::OpVariable, TypeU32ArrayPointer(state, spv::StorageClassFunction, state.program.Info().scratchDwords), state.scratchVariable.at(half), spv::StorageClassFunction);
         }
@@ -1933,7 +1755,7 @@ void EmitProgram(SpirvEmitterState& state) {
         const auto array = state.module.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, indexed));
         const auto zero = state.module.Constant(spv::OpConstantNull, array);
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
-            if (!state.meshWindowBuffer) state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, array), state.vectorWindowVariable.at(half), spv::StorageClassFunction, zero);
+            state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, array), state.vectorWindowVariable.at(half), spv::StorageClassFunction, zero);
             for (const auto slot : state.vectorWindowSlots.at(half)) {
                 state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), slot, spv::StorageClassFunction, ConstantU32(state, 0u));
             }
@@ -1942,10 +1764,9 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.pixelValidMaskVariable != 0u) {
         state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.pixelValidMaskVariable, spv::StorageClassFunction);
     }
-    for (std::size_t entry = 0; entry < state.mergePendingVariables.size(); ++entry) {
-        const auto value = PixelInfo(state).merges[entry].blend.enabled ? TypeF32Vector(state, 4u) : TypeU32(state);
-        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, value), state.mergeValueVariables[entry], spv::StorageClassFunction);
-        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.mergePendingVariables[entry], spv::StorageClassFunction, ConstantU32(state, 0u));
+    if (state.mergePendingVariable != 0u) {
+        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.mergeWordVariable, spv::StorageClassFunction);
+        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.mergePendingVariable, spv::StorageClassFunction, ConstantU32(state, 0u));
     }
     for (std::uint32_t half = 0; half < state.laneCount; half++) {
         auto& lane = half == 0u ? ctx : high;
@@ -1954,7 +1775,6 @@ void EmitProgram(SpirvEmitterState& state) {
         }
     }
     EmitLdsBufferBase(state);
-    EmitScratchPoolAcquire(state);
     if (state.requirements.ldsLock) {
         const auto firstInvocation = state.module.AllocateId();
         state.module.AddFunction(spv::OpIEqual, TypeBool(state), firstInvocation, EmitLocalInvocationIndex(state), ConstantU32(state, 0u));
@@ -1982,11 +1802,9 @@ void EmitProgram(SpirvEmitterState& state) {
         for (std::uint32_t pixel = 3u; pixel-- > 0u;) selected = Select(state, TypeU32(state), EmitCompareU32Constant(state, spv::OpIEqual, quad, pixel), word(pixel), selected);
         state.sampleOrderWord = selected;
     }
-    if (AlphaToCoverage(state)) {
-        StoreCoverage(state, ConstantI32(state, -1));
-        for (const auto variable : {state.alphaCoverageVariable, state.exportedCoverageVariable}) {
-            if (variable != 0u) state.module.AddFunction(spv::OpStore, variable, ConstantI32(state, -1));
-        }
+    if (AlphaToCoverage(state)) StoreCoverage(state, ConstantI32(state, -1));
+    for (const auto written : state.blendTargetWritten) {
+        if (written != 0u) state.module.AddFunction(spv::OpStore, written, ConstantU32(state, 0u));
     }
     EmitBdaAnchors(state);
     if (state.pointSizeVariable != 0u && state.inputInfo.vertex != nullptr && state.inputInfo.vertex->pointList) {
@@ -2068,7 +1886,7 @@ void EmitProgram(SpirvEmitterState& state) {
             state.module.AddFunction(spv::OpKill);
             EmitLabel(state, mergeLabel);
         }
-        EmitReturnReleasingScratch(state);
+        state.module.AddFunction(spv::OpReturn);
     } else {
         StructuredFunctionState functionState;
         EmitControlFlow(ctx, functionState, program);
@@ -2118,17 +1936,6 @@ std::uint32_t EmitMeshDrawParameter(SpirvValueEmitContext& ctx, const IrValue& i
 
 namespace {
 
-std::uint32_t MeshPushAddress(SpirvEmitterState& state, std::uint32_t first) {
-    const auto push = [&](std::uint32_t dword) {
-        const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + dword));
-        const auto value = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-        return Unary(state, spv::OpUConvert, TypeScalarU64(state), value);
-    };
-    return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), push(first), Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state), push(first + 1u), ConstantU32(state, 32u)));
-}
-
 std::uint32_t MeshArgumentAddress(SpirvEmitterState& state) {
     const auto push = [&](std::uint32_t dword) {
         const auto pointer = state.module.AllocateId();
@@ -2165,16 +1972,6 @@ std::uint32_t EmitMeshRestartStart(SpirvValueEmitContext& ctx, const IrValue& in
         const auto position = state.module.AllocateId();
         state.module.AddFunction(spv::OpExtInst, TypeU32(state), position, GlslStd450(state), GLSLstd450UMin, ctx.Arg(inst, 0), last);
         return LoadMeshArgumentWord(state, address, Binary(state, spv::OpIAdd, TypeU32(state), position, ConstantU32(state, MeshRestartTableDword)));
-    });
-}
-
-std::uint32_t EmitMeshCapturedWord(SpirvValueEmitContext& ctx, const IrValue& inst) {
-    auto& state = ctx.state;
-    if (state.program.Resources().stage != IrShaderStage::Mesh) {
-        ctx.Fail(inst, "captured geometry input read outside a mesh shader");
-    }
-    return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 1), [&]() {
-        return LoadMeshArgumentWord(state, MeshPushAddress(state, MeshCapturedItemAddressDword), ctx.Arg(inst, 0));
     });
 }
 
@@ -2321,14 +2118,7 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 const auto raw = ExportRawComponent(ctx, data, 0);
                 const auto f32 = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw);
-                const auto& pixel = *state.inputInfo.pixel;
-                if (std::isinf(pixel.psDepthExportMin) && std::isinf(pixel.psDepthExportMax)) {
-                    state.module.AddFunction(spv::OpStore, state.depthVariable, f32);
-                } else {
-                    const auto clamped = state.module.AllocateId();
-                    state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450NClamp, f32, ConstantF32Value(state, pixel.psDepthExportMin), ConstantF32Value(state, pixel.psDepthExportMax));
-                    state.module.AddFunction(spv::OpStore, state.depthVariable, clamped);
-                }
+                state.module.AddFunction(spv::OpStore, state.depthVariable, f32);
             }
             if ((exp.en & 2u) != 0u && state.stencilRefVariable != 0u) {
                 auto raw = ExportRawComponent(ctx, data, 1);
@@ -2341,7 +2131,7 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 const auto raw = ExportRawComponent(ctx, data, 2);
                 const auto value = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitcast, TypeI32(state), value, raw);
-                StoreCombinedCoverage(state, value, state.exportedCoverageVariable, state.alphaCoverageVariable);
+                StoreCoverage(state, value);
             }
             return;
         }
@@ -2354,29 +2144,23 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
         auto value = ExportVector(ctx, data, exp, uintOutput);
         if (state.program.Resources().stage == IrShaderStage::Pixel && exp.kind == ExportTargetKind::Mrt) {
             if (exp.index >= 8u) throw std::runtime_error("fragment export target exceeds the runtime mapping table");
-            const auto exported = value;
-            const auto mapping = state.registrationModules ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), EmitShaderDataDwordLoad(state, state.program.Metadata().bindings.RuntimeStateDword() + RuntimeAbi::StateExportMappings + exp.index / 4u), ConstantU32(state, exp.index % 4u * 8u)) : 0u;
-            const auto mapped = [&] {
-                std::array<std::uint32_t, 4> components{};
-                for (std::uint32_t component = 0; component < components.size(); ++component) {
-                    const auto index = state.registrationModules ? EmitAndConstant(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), mapping, ConstantU32(state, component * 2u)), 3u) : state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportBase + exp.index * 4u + component, component);
-                    components[component] = state.module.AllocateId();
-                    state.module.AddFunction(spv::OpVectorExtractDynamic, uintOutput ? TypeU32(state) : TypeF32(state), components[component], exported, index);
-                }
-                const auto result = state.module.AllocateId();
-                state.module.AddFunction(spv::OpCompositeConstruct, vectorType, result, components[0], components[1], components[2], components[3]);
-                return result;
-            };
-            constexpr std::uint32_t identityMapping = 0xe4u;
-            value = state.registrationModules ? EmitValueIfElse(state, EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, mapping, 0xffu), identityMapping), vectorType, [&] { return exported; }, mapped) : mapped();
+            std::array<std::uint32_t, 4> components{};
+            for (std::uint32_t component = 0; component < components.size(); ++component) {
+                const auto index = state.registrationModules ? EmitAndConstant(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), EmitShaderDataDwordLoad(state, state.program.Metadata().bindings.RuntimeStateDword() + RuntimeAbi::StateExportMappings + exp.index / 4u), ConstantU32(state, exp.index % 4u * 8u + component * 2u)), 3u) : state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ExportBase + exp.index * 4u + component, component);
+                components[component] = state.module.AllocateId();
+                state.module.AddFunction(spv::OpVectorExtractDynamic, uintOutput ? TypeU32(state) : TypeF32(state), components[component], value, index);
+            }
+            const auto mapped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, vectorType, mapped, components[0], components[1], components[2], components[3]);
+            value = mapped;
             if (exp.index == 0u && !uintOutput && AlphaToCoverage(state)) StoreAlphaCoverage(state, value);
             const auto mode = MrtOutputMode(state, exp);
-            const auto& merges = PixelInfo(state).merges;
-            if (const auto merge = std::ranges::find(merges, exp.index, &TargetMerge::target); merge != merges.end()) {
-                if (uintOutput || mode == 5u || mode == 6u) FailEmit(std::string(merge->blend.enabled ? "blending into an unclamped normalized color target" : "a partial write of a packed color target") + " cannot take an integer or 16-bit normalized export");
-                MergeColorTarget(state, static_cast<std::size_t>(merge - merges.begin()), value);
+            if (PixelInfo(state).mergeMask != 0u && exp.index == PixelInfo(state).mergeTarget) {
+                if (uintOutput || mode == 5u || mode == 6u) FailEmit("a partial write of a packed color target cannot take an integer or 16-bit normalized export");
+                MergeColorTarget(state, value);
             }
-            if (!uintOutput && mode != 5u && mode != 6u) value = SelectExportPacking(state, exp.index, value, mode == 4u);
+            if (!uintOutput && mode != 5u && mode != 6u) value = SelectExportPacking(state, exp.index, value);
+            if (state.blendTargetWritten[exp.index] != 0u) state.module.AddFunction(spv::OpStore, state.blendTargetWritten[exp.index], ConstantU32(state, 1u));
         }
         if (exp.kind == ExportTargetKind::Position) {
             if (state.inputInfo.vertex == nullptr) {
@@ -2385,7 +2169,7 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
             if (state.inputInfo.vertex->clipSpace.enabled) {
                 value = ConvertPositionToClipSpace(state, value);
             }
-            if (state.depthRangeRemap && (state.program.Resources().stage == IrShaderStage::Vertex || state.program.Resources().stage == IrShaderStage::TessellationEvaluation)) {
+            if (state.depthRangeRemap && state.program.Resources().stage == IrShaderStage::Vertex) {
                 value = RemapPositionDepth(state, value);
             }
         }

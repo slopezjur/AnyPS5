@@ -66,14 +66,15 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 void GuestArenaMapZero_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes);
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
-void* GuestArenaMapAliasForImport_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool* boundsRefused);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
 bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end);
 void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaCompareResidentWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaComparedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
 void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
+std::size_t GuestArenaAliasedPages_nid_postfix(std::uintptr_t* pages, std::uintptr_t* identities, std::size_t capacity, std::size_t* pageBytes);
 void GuestArenaForgetSection_nid_postfix(void* section);
+void GuestArenaSavedMemory_nid_postfix(std::uint64_t* bytes, std::uint64_t* blocks);
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 bool GuestArenaForgetReusableSection_nid_no_patch(void* section);
@@ -87,13 +88,45 @@ bool GuestArenaSharedBackingRuns_nid_postfix(std::uintptr_t address, std::size_t
 bool GuestArenaOverlapsHostRegion_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaReleaseHostRegion_nid_no_patch(const void* pointer, std::size_t bytes);
 #endif
-bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags);
-bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count);
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
+// Owned blocks (WindowsMappings::ArmOwned, the driver's owned proofs; write watch, no protection
+// change and no fault): arms every 64 KiB block overlapping the range (`count` = their number) and
+// stores their armed words, or arms none (false: a block that cannot be armed, outside the arena,
+// or not Windows). Flag 1 lets private commits be armed. OwnedUnchanged: whether every block still
+// holds the word armed and no page of the range was written since (GetWriteWatch without reset; no
+// CPU store, no mapping or protection change). Counts, since the last call, up to `count` values:
+// arms, blocks newly armed, refusals, guest write faults inside armed blocks (none raised or
+// resolved by owned blocks), other disarms, blocks armed with private pages, blocks armed with
+// nothing mapped, blocks armed partly mapped, disarms by a collect that took a written page, pages
+// whose write bits an arming took, GetWriteWatch queries of OwnedUnchanged, OwnedUnchanged answers
+// that found a written page, OwnedUnchanged answers asked again under the lock, answers with a mark
+// held from the blocks' checks alone, answers with a mark that queried, then refusals by reason (WindowsMappings::OwnedRefusal: none, outside
+// the arena or a host region, shared or aliased view, pinned or importing, host write open,
+// protection change in flight, not writable or another mapping type, private with flag 1 clear,
+// nothing mapped (no longer refused), not write-watched).
+// OwnedMark: a new mark for OwnedUnchanged (0: none, every answer queries): an answer with a mark
+// may rely on a block's check by a query that began after the mark (WindowsMappings::OwnedUnchanged).
+// EndSetProtection ends the guest protection change that GuestArenaSetProtection began, after the
+// caller's own protection call.
+inline constexpr std::size_t GuestArenaOwnedCountSlots = 25;
+bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags);
+bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count, std::uint64_t mark);
+std::uint64_t GuestArenaOwnedMark_nid_no_patch();
+void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t count);
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::uint32_t GuestArenaMappingLockOwner_nid_no_patch();
+std::uint8_t GuestArenaGuardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaUnguardAccess_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaOpenAccessGuards_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+bool GuestArenaAccessGuarded_nid_no_patch(std::uintptr_t address);
+std::size_t GuestArenaAccessGuardedSubpages_nid_no_patch();
+void GuestArenaSetAccessGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address));
+void GuestArenaSetMappingGuardObserver_nid_no_patch(void (*callback)(std::uintptr_t address, std::size_t bytes, bool releasing));
+void GuestArenaRunUnderMappingLock_nid_no_patch(void (*body)(void*), void* argument);
 
 }
 

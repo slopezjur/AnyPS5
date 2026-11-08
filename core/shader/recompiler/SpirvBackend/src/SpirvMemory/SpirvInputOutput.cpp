@@ -156,7 +156,15 @@ namespace ShaderRecompiler
     }
 
     bool OrderedPixelShader(const SpirvEmitterState& state) {
-        return state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && (state.inputInfo.pixel->psOrderedPixelShader || !state.inputInfo.pixel->merges.empty());
+        return state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && (state.inputInfo.pixel->psOrderedPixelShader || state.inputInfo.pixel->mergeMask != 0u);
+    }
+
+    bool BlendableTarget(const SpirvEmitterState& state, std::uint32_t index) {
+        if (state.program.Resources().stage != IrShaderStage::Pixel || state.inputInfo.pixel == nullptr || index >= std::size(state.inputInfo.pixel->targetOutputMode)) return false;
+        const auto& pixel = *state.inputInfo.pixel;
+        const auto mode = pixel.targetOutputMode[index];
+        if (mode == 5u || mode == 6u || mode == 7u || pixel.psDepthExportEnable || pixel.psSampleMaskExportEnable) return false;
+        return std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFragmentShaderPixelInterlockEXT)) != state.supportedCapabilities.end();
     }
 
     const SpirvInputBinding* SpirvInputBindingForParameter(const SpirvEmitterState& state, std::uint32_t location) {

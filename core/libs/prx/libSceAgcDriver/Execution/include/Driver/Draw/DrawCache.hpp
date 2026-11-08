@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -69,17 +70,25 @@ struct DrawRecipeRecord {
     bool Expired() const;
 };
 
+struct PreparedDrawRecord {
+    std::vector<std::weak_ptr<const DispatchVariant>> stages;
+    std::size_t shaders = 0;
+    std::shared_ptr<const Graphics::AheadDraw> prepared;
+    const Graphics::AheadDraw* For(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::size_t shaderCount) const;
+};
+
 struct DrawEntry {
 
     std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<const PreparedDrawRecord> prepared;
 
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
     std::uint64_t touched = 0;
+    bool probation = false;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
-    std::shared_ptr<DrawEntry> donor;
 };
 
 using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
@@ -89,7 +98,18 @@ struct StageDataHit {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
 
-enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, QueuedStores, Layout, Gate, Stages, Count };
+struct DrawKeyComponents {
+    std::uint64_t stable = 0;
+    std::array<std::uint64_t, 3> userData{};
+    std::uint64_t auxiliary = 0;
+    std::uint64_t device = 0;
+    std::uint64_t shaderSet = 0;
+    std::array<std::uint64_t, Graphics::DrawKeyRegisters.size()> ranges{};
+};
+
+enum class DrawKeyChange : std::size_t { Stable, PixelUserData, VertexUserData, HullUserData, Auxiliary, Device, NewShaderSet, Unchanged, Count };
+
+enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, shapeUpdates = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
@@ -99,8 +119,9 @@ struct DrawEntryCounters {
 
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
-    std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0, byteEvictions = 0;
-    std::array<std::uint64_t, 6> registerKeyMissChanges{};
+    std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawKeyChange::Count)> registerKeyMissChanges{};
+    std::array<std::uint64_t, Graphics::DrawKeyRegisters.size()> stableRangeChanges{};
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
@@ -125,7 +146,6 @@ enum class DrawVerdict { Drawn, Nothing, Rejected };
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
-    std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied;
     std::uint64_t forgetSerial = 0;
@@ -137,8 +157,6 @@ struct StageCapture {
 struct RelocatableUserWord {
     std::uint32_t reg;
     std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
-    bool value = false;
-    std::uint32_t high = 0;
 };
 
 struct DrawRelocation {
@@ -166,6 +184,11 @@ struct DrawRelocationCounters {
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+bool SameCompilation(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b, std::uint32_t hiddenUserWords = 0);
+std::shared_ptr<DrawEntry> BuildAheadEntry(const std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, std::shared_ptr<const Graphics::AheadDraw> prepared, std::size_t preparedShaders);
+ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, std::uint32_t pushOffset, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics = std::nullopt);
+std::uint64_t StageUserDataMask(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo);
+std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, const StageCapture& capture, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads);
 
 }
 

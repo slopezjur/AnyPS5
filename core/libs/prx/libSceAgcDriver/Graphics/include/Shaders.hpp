@@ -2,7 +2,6 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERS_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
-#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "Recompiler.hpp"
 #include <array>
 #include <cstddef>
@@ -38,7 +37,6 @@ struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
-    const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews = nullptr;
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {
@@ -69,6 +67,17 @@ inline VkPipelineStageFlags PipelineStages(std::span<const CompiledShader> shade
         }
     }
     return result;
+}
+
+inline VkShaderStageFlags BindlessHeapStages(std::span<const CompiledShader> shaders) {
+    VkShaderStageFlags stages = 0;
+    bool heap = false;
+    for (const auto& shader : shaders) {
+        Require(shader.program != nullptr, "missing compiled shader");
+        heap = heap || shader.program->bindlessHeap;
+        stages |= VulkanStage(shader.stage);
+    }
+    return heap ? stages : 0u;
 }
 
 inline VkShaderStageFlags PushConstantStages(std::span<const CompiledShader> shaders) {

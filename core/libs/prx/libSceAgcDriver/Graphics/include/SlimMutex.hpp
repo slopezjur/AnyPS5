@@ -3,7 +3,9 @@
 
 #include <atomic>
 #include <thread>
-#include "prx/libc/include/PreciseWait.hpp"
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -19,7 +21,9 @@ public:
             while (locked.load(std::memory_order_relaxed)) {
                 if (spins < 128) {
                     ++spins;
-                    PreciseSpinPause();
+#if defined(__x86_64__) || defined(_M_X64)
+                    _mm_pause();
+#endif
                 } else {
                     std::this_thread::yield();
                 }

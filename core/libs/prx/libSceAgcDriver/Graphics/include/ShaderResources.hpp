@@ -7,7 +7,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
-#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
 #include <atomic>
@@ -34,9 +33,48 @@ void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
+// What the texture caches hold: every live sampled texture's own image (SampledTextureMemory), the
+// part of it the sampled cache's snapshot entries account, the storage image cache's bytes, and the
+// part of `sampled` in the overflow type (SampledTextureOverflowMemory): the caches' own, so not
+// other usage, but not taken from the sampled ceiling either (the driver moves those pages out of
+// the VRAM when it needs the room; the overflow budget bounds them).
+struct TextureMemoryUse {
+    std::uint64_t sampled = 0;
+    std::uint64_t sampledCached = 0;
+    std::uint64_t storageCached = 0;
+    std::uint64_t overflow = 0;
+};
+// The texture caches' budgets, out of one share of the device-local heap: VK_EXT_memory_budget's
+// budget (or APS5_VRAM_BUDGET_MIB) less the VramBudget headroom and less what everything else uses
+// (the heap's usage minus the texture bytes above: the buffer pool, unit shadows, depth surfaces,
+// presentation, the driver's own). The storage cache takes up to half of it (never more than
+// TextureCacheBudget); the sampled cache admits up to `ceiling`, what is left after the storage
+// budget and the sampled images alive outside the cache (in recorded work, in builds), and evicts
+// down to `sampled` (four fifths of it). `target` is the share (0 without VK_EXT_memory_budget: the
+// static budgets of before, the ceiling a quarter over the sampled budget). `share` is what every
+// device-local sampled image together may take, in the cache or not (the ceiling plus the images
+// outside the cache when the budgets were read): a new snapshot past it goes to system memory where it can (see Texture).
+// APS5_TEXTURE_CACHE_MIB forces both caches' budgets (and the share to the ceiling).
+// `previousTarget` (the share of the last read, 0: none) is kept while the new one is within a
+// sixty-fourth of it or 64 MiB: the reported usage moves by a few MiB as the driver frees memory
+// late (images a retired batch held) or allocates for itself, and the budgets should not follow.
+// `overflow` bounds the sampled images in the overflow type (SampledTextureOverflowMemory): the
+// driver backs them with system memory once the VRAM is taken, and lean-x24 failed to allocate one
+// with heap 1 (system memory) 11.6 of its 15.5 GB budget used and 4.7 GB of them alive, where an
+// otherwise idle RTX 3080 Laptop takes 12 GiB of them past a full VRAM (heap 1 nearly empty). So
+// the largest heap that is not device-local's budget less its usage less a sixteenth of its budget
+// (0: no such heap or no VK_EXT_memory_budget, unbounded); APS5_TEXTURE_OVERFLOW_MIB forces it.
+struct TextureCacheBudgets {
+    std::uint64_t sampled = 0;
+    std::uint64_t ceiling = 0;
+    std::uint64_t storage = 0;
+    std::uint64_t target = 0;
+    std::uint64_t share = 0;
+    std::uint64_t overflow = 0;
+};
+TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const TextureMemoryUse& use, std::uint64_t previousTarget = 0);
 std::uint64_t StorageTextureCeiling(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
-std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes, std::uint64_t storageBytes = 0);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
 std::optional<std::uint32_t> LargestDeviceLocalHeap(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureCacheBudget(const Context& context);
@@ -51,12 +89,32 @@ struct TextureCacheUse {
 TextureCacheUse TextureCacheUsage();
 void OverrideCacheBudgetForTest(std::uint64_t bytes);
 std::uint64_t SampledTextureCacheBudget(const Context& context);
+TextureCacheBudgets CurrentTextureCacheBudgets(const Context& context);
+// Cumulative sampled-cache counters (the [texture-cache] line reports them per 10 s).
+struct SampledCacheCounts {
+    std::uint64_t evicted = 0;
+    std::uint64_t evictedBytes = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t refusedBytes = 0;
+    std::uint64_t droppedSets = 0;
+    std::uint64_t refusedSets = 0;
+    std::uint64_t reclaims = 0;
+    std::uint64_t reclaimedBytes = 0;
+    std::uint64_t spilled = 0;
+    std::uint64_t spilledBytes = 0;
+    std::uint64_t oneOffReuses = 0;
+    std::uint64_t made = 0;
+    std::uint64_t spilledReuses = 0;
+    std::uint64_t overflowDropped = 0;
+    std::uint64_t overflowWaits = 0;
+};
+SampledCacheCounts SampledCacheCounters();
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
+std::shared_ptr<Texture> CachedTableTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint64_t guestBytes, bool depthCompare);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool AnyPendingCpuWrites(const Context& context);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
-bool SpirvFaultReportOnly(std::span<const std::uint32_t> words, std::uint32_t set, std::uint32_t binding);
 bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv);
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices);
 
@@ -68,7 +126,6 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
-std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
@@ -156,14 +213,9 @@ struct ImageTableReuseCounts {
     std::uint64_t replayed = 0;
     std::uint64_t writesKept = 0;
     std::uint64_t writesMade = 0;
-    std::uint64_t variantSurfaces = 0;
-    std::uint64_t variantSubstituted = 0;
-    std::uint64_t variantRejected = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
-std::uint64_t SampledTexturesCleared();
 std::uint64_t SampledLookupKeyScans();
-std::uint64_t SampledLookupKeyProofs();
 
 struct PresyncSurface {
     std::uint64_t address;
@@ -171,18 +223,36 @@ struct PresyncSurface {
     bool dccKeys;
 };
 
+// S1: the tag of the two-stage draw build (see ShaderResources).
+struct DeferredDrawBuild {
+    explicit DeferredDrawBuild() = default;
+};
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
-    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {}, bool deviceStaging = false);
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {});
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots = {});
     // Two-stage build for dispatches (see build): with `deferred` the constructor runs stage A only,
     // which needs no device lock, and Complete() runs stage B under GuestMemory::GpuMutex; until
     // then no other member may be used. `compute` and `snapshots` must outlive Complete(). An
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
+    // Whether an address-based stage A made without the lock is stale (the guest forgot memory or
+    // changed its allocations since): the dispatch then builds afresh under the lock.
+    bool StaleUnlockedAddress() const;
+    // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): the draw build in two stages, as for dispatches: the
+    // constructor runs stage A only (no device lock; no guest bytes are read: host copies wait for
+    // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages need
+    // `addressTables` (C29, APS5_NO_BDA_DRAW_SPLIT=1 off): stage A then takes the cached address space
+    // without the lock (GuestBufferMemory::AcquireRegisteredCached) and adds the draw's snapshots, and
+    // throws when the space cannot be taken that way (the caller builds under the lock). `shaders`
+    // must outlive CompleteDraw().
+    ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {}, bool addressTables = false);
+    void CompleteDraw();
+    static bool StagesUseAddressTables(std::span<const CompiledShader> shaders);
     bool Completed() const { return completed; }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
@@ -194,7 +264,6 @@ public:
     VkDescriptorSetLayout FragmentLayout() const { return fragment.layout; }
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
-    void RequireGuestBuffers() const { requireGuestBuffers(); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;
@@ -205,6 +274,9 @@ public:
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
+            // C67: a moved range read in place: the host import's buffer (`buffer` is null, `offset` is inside the import).
+            VkBuffer inPlace = VK_NULL_HANDLE;
+            VkBuffer Handle() const { return buffer != nullptr ? buffer->Handle() : inPlace; }
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
@@ -221,21 +293,8 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
-    struct DrawUse {
-        DrawUse() = default;
-        DrawUse(const DrawUse&) = delete;
-        DrawUse& operator=(const DrawUse&) = delete;
-        ~DrawUse();
-        std::shared_ptr<BdaResources> record;
-        std::shared_ptr<DrawBindings> bindings;
-        std::shared_ptr<std::atomic<bool>> ownRecord;
-    };
-    std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
-    void CompleteDrawUse(const DrawUse& use) const;
-    void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
-    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
-    static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
+    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -246,35 +305,34 @@ public:
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
     static std::size_t DrawUploadLimit();
+    // The [draw-snapshots] counters of CopyDrawInput (vertex and index inputs, APS5_PROFILE_DRAW).
+    enum class DrawInputPath : std::uint8_t { TrackedHit, OwnedHit, TrackedCopy, UntrackedCopy, Count };
+    static void CountDrawInputPath(DrawInputPath path, std::size_t bytes, std::uint8_t ownedMiss, bool owned, bool armed);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
-    void WriteBackBuffers();
+    // APS5_PROFILE_RESIDENT_CENSUS: notes the guest memory this use reaches (MarkGpuWrites and
+    // MarkGpuWritesInRun call it once per use).
+    void NoteResidentCensus() const;
+    // As MarkGpuWrites for a dispatch that left its trailing barrier deferred (Recorder::
+    // DeferDispatchBarrier): its staged copy-backs (and the direct-write marks they complete) are
+    // recorded after the run's deferred barrier (Recorder::AfterRun); `self` keeps the object.
+    void MarkGpuWritesInRun(Recorder& recorder, const std::shared_ptr<ShaderResources>& self);
+    // The guest memory whose staged shadows this object's uses fill (a dispatch run member, see
+    // Recorder::RunCommands).
+    const void* MemoryOwner() const { return &guestMemory; }
+    // Whether the build copies buffer regions on the GPU (staged shadows among them).
+    bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
+    void WriteBackBuffers(std::uint64_t shaderAddress = 0);
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
-    bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
-    bool HasHostGpuCopies() const { return guestMemory.HasHostGpuCopies(); }
-    bool HasStagedCopies() const { return guestMemory.HasStagedCopies(); }
-    const void* MemoryOwner() const { return &guestMemory; }
-    void CopyBacksAfterRun(std::shared_ptr<ShaderResources> self) { afterRunSelf = std::move(self); }
-    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
-    bool SpaceReuse() const { return spaceReuse; }
-    static bool SpaceReuseDisabled();
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
-    bool RetakeSpace() { return guestMemory.RetakeSpace(); }
-    bool SpaceHeld() const { return guestMemory.SpaceHeld(); }
-    SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const { return guestMemory.SnapshotsServedInPlace(snapshots); }
-    std::shared_ptr<const void> ReleaseSpace() { return guestMemory.ReleaseSpace(); }
-    void HoldSpaceThrough(std::uint64_t recorder, std::uint64_t serial) { guestMemory.HoldSpaceThrough(recorder, serial); }
-    bool ReleaseCompletedSpace(std::uint64_t recorder, std::uint64_t completedThrough) { return guestMemory.ReleaseCompletedSpace(recorder, completedThrough); }
     bool UsesAddressTable() const { return usesBda; }
-    std::span<const std::byte> AddressTableBytes() const;
-    bool AddressTableGuardCurrent();
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
@@ -288,10 +346,10 @@ public:
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
+    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
-    bool HoldsReleasedTexture() const;
     std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     const std::vector<std::uint32_t>& FragmentLayoutKey() const { return fragmentLayoutKey; }
@@ -311,6 +369,7 @@ public:
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static void AppendContentKeyRoles(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint8_t>& roles);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
@@ -324,11 +383,38 @@ public:
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    // Whether a stage with a BDA page table stores through guest addresses (its SPIR-V; cached).
+    static bool StagesStoreThroughAddresses(std::span<const CompiledShader> shaders);
+    // Whether every storing BDA stage stores only through an extended instruction taking a pointer.
+    static bool StagesStoreOnlyThroughExtInst(std::span<const CompiledShader> shaders);
+    // APS5_PROFILE_DRAW ([bda-template] line): what became of address-table draw builds under
+    // APS5_NO_BDA_TEMPLATES unset, by the first reason that kept one from being a template.
+    enum class TemplateOutcome : std::size_t { Storing, StoringExtOnly, StorageTable, CopiedWrites, Multisample, LoopGuard, DepthStorage, TableElement, RefreshedPerUse, DataSize, SpaceRegions, Serial, Shared, NotShared, Inserted, Count };
+    static const char* TemplateOutcomeName(TemplateOutcome outcome);
+    static std::array<std::uint64_t, static_cast<std::size_t>(TemplateOutcome::Count)> TemplateOutcomes();
+    static void CountTemplateOutcome(TemplateOutcome outcome);
     static std::uint64_t DepthGuardRefusals();
+    static std::uint64_t GuestBufferBytes(const Context& context, std::span<const std::uint32_t> words);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    // Whether a sampled texture of the set left the sampled cache (evicted, replaced, or made for
+    // one use and never admitted): such a set is not kept by the resource cache, whose entries may
+    // pin only textures the sampled cache accounts.
+    bool BindsReleasedTexture() const;
+    // The resource cache's pins on the set's sampled textures (Insert pins, every removal unpins).
+    void PinTextures(bool pin) const;
     static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
-    void CheckFaults() const;
+    void CheckFaults(std::uint64_t shaderAddress = 0) const;
+    bool InUse() const { return usesInFlight->load(std::memory_order_acquire) != 0; }
+    bool ReusesAddressSpace() const { return addressReuse; }
+    std::shared_ptr<const void> BeginUse();
+    void CompleteUse();
+    // Address-table template (APS5_NO_BDA_TEMPLATES unset): a read-only address-table draw build
+    // (no store through BDA, no written buffer or image, no GPU copies) that later draws may use
+    // while earlier uses are still in flight; each use takes its own descriptor set for changed data
+    // words or moved read-only buffers, and the template itself is never written after its build.
+    bool SharesUses() const;
+    void EndUse() noexcept;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -338,9 +424,8 @@ public:
     struct ProofReport {
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
-        bool audited = false;
     };
-    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, std::span<const GuestMemorySnapshot> snapshots = {});
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
@@ -359,18 +444,7 @@ public:
     std::size_t BindingCount() const { return bindings.size(); }
     // Why the fast proof of a Revalidate left the object to the full walk (the [rescache]
     // revalidate line's reasons); Count: it did not.
-    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Replaced, Audit, Count };
-    struct CollectRefusals {
-        std::uint64_t sampled = 0;
-        std::uint64_t storage = 0;
-        std::uint64_t uncommitted = 0;
-        std::uint64_t unwatched = 0;
-        std::uint64_t other = 0;
-        std::uint64_t surfaces = 0;
-        std::uint64_t bytes = 0;
-    };
-    static CollectRefusals CollectRefusalCounts();
-    static std::array<std::uint64_t, static_cast<std::size_t>(FastFail::Count)> FullWalkNanoseconds();
+    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Committed, Replaced, Audit, Count };
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.
     enum class OwnRefreshFallback : std::size_t { Disabled, Snapshot, Keys, ForeignView, SurfaceKey, NotImported, Uncached, Rerun, Count };
@@ -429,7 +503,6 @@ private:
         std::int32_t pushByte = -1;
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
-        bool oversized = false;
     };
     struct DataPatch {
         std::size_t allocation;
@@ -450,29 +523,29 @@ private:
         ShaderRecompiler::ShaderStage stage = ShaderRecompiler::ShaderStage::Compute;
         const ShaderRecompiler::RecompileResult* program = nullptr;
         const ShaderRecompiler::DescriptorBinding* images = nullptr;
+        const ShaderRecompiler::DescriptorBinding* storageImages = nullptr;
         std::size_t mapAllocation = std::numeric_limits<std::size_t>::max();
         std::vector<std::uint32_t> map;
         std::vector<ShaderRecompiler::ImageTableEntryPoison> poison;
-        std::vector<std::shared_ptr<const std::string>> messages;
+        std::vector<std::string> messages;
         std::uint32_t elementBase = 0;
         std::uint32_t set = 0;
         std::size_t firstSampler = 0;
         std::size_t samplerCount = 0;
-        bool sampled = false;
-        bool storage = false;
         std::vector<std::size_t> elementTextures;
-        std::vector<std::uint32_t> representatives;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> samplerRejections;
     };
     std::vector<TableStage> tableStages;
     std::array<std::size_t, 2> tableBindings{std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()};
-    std::array<std::uint32_t, 2> tableElements{};
     std::array<std::size_t, 2> storageTableBindings{std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()};
+    std::array<std::uint32_t, 2> sampledTableCapacity{};
+    std::array<std::uint32_t, 2> tableElements{};
     TableStage& tableStage(const CompiledShader& shader);
     static const ShaderRecompiler::DescriptorBinding* tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage);
     std::uint32_t rejectTableElement(TableStage& table, std::span<const std::uint32_t> words, const std::string& message);
     void addSamplerTable(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags, TableStage& table);
     void resolveImageTables();
+    void resolveStorageImageTables();
     void finishImageTables();
 
     // A host-imported buffer region the set reads in place, with its import's identity at build time.
@@ -501,10 +574,9 @@ private:
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
-    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
-    void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags);
+    void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags, bool guardedUnnormalizedWrap);
     // Stage A: one record per planned image element (ImageRecord), in plan order: the decoded
     // descriptor and its surface size (computed once for the build), the write watch walked so stage
     // B's collects are memo hits (APS5_NO_PRECOLLECT=1 skips the pass entirely), and for a sampled
@@ -531,6 +603,7 @@ private:
         std::shared_ptr<StorageTexture> source;
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> entryCommitted;
     };
     std::vector<ImageRecord> imageRecords;
     struct PreviousSampled {
@@ -538,7 +611,6 @@ private:
         bool depthCompare = false;
         VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D;
         bool firstSample = false;
-        bool layerRows = false;
         std::shared_ptr<Texture> texture;
     };
     PreviousSampled previousSampled;
@@ -546,15 +618,15 @@ private:
     std::size_t nextImageRecord = 0;
     // Stage B: the record's texture when the fastRevalidate predicate proves it current under the
     // lock and the cache still holds it; null sends the element to cachedTexture.
-    std::shared_ptr<Texture> fastTexture(ImageRecord& record);
+    std::shared_ptr<Texture> fastTexture(const ImageRecord& record);
     void resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding, Binding& item, std::span<const std::shared_ptr<Sampler>> shaderSamplers);
-    void applySamplerVariants();
+    void applyAnisoOverride();
     void forgetDeferredInputs();
     void release() noexcept;
-    void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+    void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool unlocked = false);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
-    VkDescriptorBufferInfo wholeDwordRange(VkDescriptorBufferInfo info) const;
     void noteReusable();
+    bool proveBuild(std::span<const CompiledShader> shaders, ProofReport* report);
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -575,8 +647,9 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+        std::array<std::uint64_t, 4> untracked{};
     };
-    bool keepsTemplateRecords() const;
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
@@ -589,8 +662,6 @@ private:
         bool storage;
         bool viewUncompressed;
         bool sourceEligible = false;
-        bool depthCompare = false;
-        bool sourceRefreshed = false;
     };
     // `serialBefore` is StorageTexture::PendingSerial() loaded before any check of this Revalidate;
     // `refreshed` the surfaces refreshOwnObjects resolved earlier in the same Revalidate (empty on
@@ -616,14 +687,11 @@ private:
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
-    std::shared_ptr<ShaderResources> afterRunSelf;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
     bool bdaReadOnly = true;
-    bool spaceReuse = false;
-    bool faultReportOnly = true;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
     bool faultChecks = false;
@@ -656,28 +724,25 @@ private:
     std::shared_ptr<const TableDescriptors> keptTable(std::size_t set, std::shared_ptr<const std::vector<std::weak_ptr<Texture>>>& held) noexcept;
     std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
-    mutable std::vector<VkDescriptorBufferInfo> descriptorBuffers;
+    std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
-    struct FaultDescriptor {
-        std::size_t write;
-        std::size_t buffer;
-        std::uint32_t element;
+    struct MovedWordBuffer {
+        std::size_t allocation;
+        std::vector<std::uint32_t> words;
+        std::size_t size;
+        std::shared_ptr<Buffer> buffer;
     };
-    std::vector<FaultDescriptor> faultDescriptors;
-    void prepareFaultSlot() const;
-    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
-    std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
+    mutable std::vector<MovedWordBuffer> movedWordBuffers;
+    mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
     std::chrono::steady_clock::time_point lastFullWalk = std::chrono::steady_clock::now();
-    std::uint64_t walkImportGeneration = HostImportSetGeneration();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnlyRanges;
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
-    std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
@@ -699,13 +764,18 @@ private:
         bool integerBorder = false;
         bool singleLevelImage = false;
         bool mipmappedImage = false;
-        std::optional<std::uint32_t> pinnedLod;
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool addressReuse = false;
+    bool bdaTemplate = false;
+    bool sharedUses = false;
+    bool reuseProved = false;
+    std::shared_ptr<std::atomic<std::uint32_t>> usesInFlight = std::make_shared<std::atomic<std::uint32_t>>(0u);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
-    std::vector<ShaderRecompiler::RegisteredImageView> registeredImageViews;
+    std::vector<std::array<std::uint64_t, 4>> storageUntracked;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,
     // no image other than the object's own sources has results pending over its surfaces and
@@ -717,9 +787,13 @@ private:
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
-    bool importsReconcilable = false;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
+    // Async lane (VulkanDevice's dispatch record, APS5_NO_LANE_TEMPLATE_EDGE): the lane of the
+    // last data refresh not yet ordered before the other lane's work (-1: none), and the lanes
+    // whose recorded dispatches read the data buffers since (bit per lane).
+    int dataWriterLane = -1;
+    std::uint8_t dataReaderLanes = 0;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;
@@ -748,10 +822,17 @@ private:
     std::span<const GuestMemorySnapshot> deferredSnapshots;
     // The deferred build is address-based: everything runs in Complete().
     bool lockedBuild = false;
+    // A deferred dispatch build whose address-based stage A took the cached space without the lock
+    // (APS5_NO_BDA_DISPATCH_SPLIT=1 off), and the guest's forget serial and registry generation then.
+    bool unlockedAddress = false;
+    std::uint64_t addressStageForget = 0;
+    std::uint64_t addressStageGeneration = 0;
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
+    bool deferredDraw = false;
     bool completed = false;
     std::chrono::steady_clock::time_point phaseStart;
+    double phaseWaited = 0;
 };
 
 // Built ShaderResources by the content the build consumed (see ShaderResources::ContentKey), so a
@@ -773,6 +854,8 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    // The entry without touching it or counting a miss (the S1 preparer's look ahead).
+    std::shared_ptr<ShaderResources> Peek(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
@@ -781,6 +864,8 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    // Drops every entry binding one of `textures` (sampled textures the sampled cache let go).
+    void RemoveTextures(const std::unordered_set<const Texture*>& textures, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     bool TryRemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
@@ -799,8 +884,8 @@ public:
 
 private:
     void erase(const Key& key);
+    void drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteMiss(const Key& key);
-    void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);
     void noteReturn(const Key& key);
     void noteUse(const Key& key);
@@ -832,8 +917,16 @@ private:
     mutable AgcDriver::Mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // The entries by each sampled texture they bind (once per entry): RemoveTextures without a scan.
+    std::unordered_multimap<const Texture*, decltype(entries)::iterator> textureIndex;
+    void indexTextures(decltype(entries)::iterator entry, bool add);
     std::size_t capacity = 0;
     bool fixedCapacity = false;
+    // Address-table builds (ReusesAddressSpace) have a bound of their own, so the other entries'
+    // churn (dispatch keys) does not evict them before the next frame draws them again, and they
+    // never displace the others: APS5_ADDRESS_TEMPLATE_ENTRIES (default 2048).
+    std::size_t addressEntries = 0;
+    std::size_t addressCapacity = 0;
     std::list<std::size_t> evictedOrder;
     std::unordered_map<std::size_t, decltype(evictedOrder)::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;

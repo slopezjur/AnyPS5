@@ -1,5 +1,6 @@
 #include "ShaderDiskCache.hpp"
-#include "ImageTableAbi.hpp"
+#include "EnvironmentGuards.hpp"
+#include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCachePack.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -14,7 +15,9 @@
 #include "IntermediateRepresentation/IrBlock.hpp"
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,9 +27,11 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <latch>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -45,6 +50,8 @@
 #include <io.h>
 #include <fcntl.h>
 #include "prx/libc/include/General.hpp"
+#else
+#include <unistd.h>
 #endif
 
 namespace {
@@ -61,6 +68,7 @@ void setEnvironment(const char* name, const std::string& value) {
 #else
     setenv(name, value.c_str(), 1);
 #endif
+    ShaderRecompiler::RefreshEnvironmentGuards();
 }
 
 void setPathEnvironment(const char* name, const std::filesystem::path& value) {
@@ -114,7 +122,6 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
     }
     constexpr auto dispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);
     constexpr DWORD deleteFile = 0x00000001, posixSemantics = 0x00000002;
-    bool pendingDeletes = false;
     for (const auto& file : files) {
         const auto handle = CreateFileW(file.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -122,31 +129,16 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
         require(!error, "cannot open " + file.string() + " for deletion: " + error.message());
         struct Close { HANDLE file; ~Close() { CloseHandle(file); } } close{handle};
         DWORD flags = deleteFile | posixSemantics;
-        if (!SetFileInformationByHandle(handle, dispositionInfoEx, &flags, sizeof(flags))) {
-            const DWORD failure = GetLastError();
-            FILE_DISPOSITION_INFO disposition{TRUE};
-            if (failure == ERROR_INVALID_PARAMETER) {
-                SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
-                pendingDeletes = true;
-            } else {
-                error.assign(static_cast<int>(failure), std::system_category());
-            }
-        }
+        if (!SetFileInformationByHandle(handle, dispositionInfoEx, &flags, sizeof(flags))) error.assign(static_cast<int>(GetLastError()), std::system_category());
         require(!error, "cannot delete " + file.string() + ": " + error.message());
     }
-    std::filesystem::remove_all(directory, error);
-    if (error && pendingDeletes) {
-        std::fprintf(stderr, "shader disk cache: %s has no POSIX delete (ERROR_INVALID_PARAMETER); entries the cache still maps cannot be deleted there, so the directory was left behind\n", directory.string().c_str());
-        return;
-    }
-#else
-    std::filesystem::remove_all(directory, error);
 #endif
+    std::filesystem::remove_all(directory, error);
     require(!error, "cannot remove the shader cache test directory: " + error.message());
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageAtomic64 == right.imageAtomic64 && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -160,10 +152,7 @@ bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<
 void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShaderArtifact& right, const char* what) {
     const std::string prefix = std::string(what) + ": ";
     require(left.spirv == right.spirv, prefix + "SPIR-V differs");
-    require(left.meshWindowBuffer == right.meshWindowBuffer, prefix + "mesh window buffer flags differ");
     require(left.bdaAbiVersion == right.bdaAbiVersion, prefix + "BDA ABI version differs");
-    require(left.descriptorFaults == right.descriptorFaults, prefix + "descriptor fault count differs");
-    require(left.windowLaneGuards == right.windowLaneGuards, prefix + "window lane guards differ");
     require(left.runtimeAbiVersion == right.runtimeAbiVersion, prefix + "runtime ABI version differs");
     require(left.memoryOffsetDword == right.memoryOffsetDword, prefix + "memory offset differs");
     require(left.shaderDataDwords == right.shaderDataDwords && left.imageMetadataDword == right.imageMetadataDword && left.runtimeImageCount == right.runtimeImageCount && left.runtimeImageResources == right.runtimeImageResources, prefix + "compact data layout differs");
@@ -177,7 +166,6 @@ void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShade
     require(left.stencilReferences == right.stencilReferences, prefix + "stencil reference set differs");
     require(left.stencilReplaySafe == right.stencilReplaySafe, prefix + "stencil replay proof differs");
     require(left.bdaWrites == right.bdaWrites, prefix + "BDA write flag differs");
-    require(left.layerReplaySafe == right.layerReplaySafe, prefix + "layer replay proof differs");
     require(left.stencilReferenceDword == right.stencilReferenceDword, prefix + "stencil replay push offset differs");
     require(left.fragmentParameters.size() == right.fragmentParameters.size(), prefix + "fragment parameter count differs");
     for (std::size_t i = 0; i < left.fragmentParameters.size(); ++i) {
@@ -196,6 +184,8 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
     require(left.workgroupMemoryDwords == right.workgroupMemoryDwords, prefix + "workgroup memory stride differs");
     require(left.poisonedSrtReads == right.poisonedSrtReads, prefix + "poisoned SRT read counts differ");
+    require(left.hasDeferredDirectImage == right.hasDeferredDirectImage, prefix + "deferred direct image flag differs");
+    require(left.hasGuardedUnnormalizedWrap == right.hasGuardedUnnormalizedWrap, prefix + "guarded unnormalized wrap flag differs");
     require(left.shaderDataUserWords == right.shaderDataUserWords, prefix + "shader-data user words differ");
     require(left.imageTableRanges == right.imageTableRanges && left.imageTableShader == right.imageTableShader && left.imageTableFaults == right.imageTableFaults && left.imageTablePoison.size() == right.imageTablePoison.size(), prefix + "image table invocation data differs");
     require(left.imageTableReadRanges == right.imageTableReadRanges, prefix + "image table read ranges differ");
@@ -241,6 +231,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.imageDepthCompare = {false, true, false};
     binding.imageWritten = {false, true, true};
     binding.imageAtomic = {false, true, false};
+    binding.imageAtomic64 = {true, false, false};
     binding.imageShapes = {DescriptorImageShape::Image2D, DescriptorImageShape::Image3D};
     binding.bufferAtomic = {true};
     binding.bufferWritten = {false, false, true, true, false};
@@ -249,7 +240,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
     binding.imageUnnormalized = {true, false, seed % 2 == 0};
     binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
-    binding.imageSamplers = {0x5u, 0u, 0x8000000080000000u};
+    binding.imageSamplers = {0x5u, 0u, 0x80000000u};
     binding.bufferRead = {true, false, false, true, true, false};
     binding.bufferExtent = {32, 0, 16, 4096, 8, 0};
     return binding;
@@ -257,7 +248,6 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
 
 RecompileResult sampleResult() {
     RecompileResult result;
-    result.meshWindowBuffer = true;
     std::vector<std::uint32_t> words(1000);
     for (std::size_t i = 0; i < words.size(); ++i) words[i] = static_cast<std::uint32_t>(i * 2654435761u);
     words[0] = 0x07230203u;
@@ -266,11 +256,19 @@ RecompileResult sampleResult() {
     result.bindings[1].kind = DescriptorKind::StorageBuffer;
     result.bindings[1].role = DescriptorRole::GuestBuffers;
     result.bindings[1].imageShape.reset();
+    DescriptorBinding stores{};
+    stores.kind = DescriptorKind::StorageImage;
+    stores.role = DescriptorRole::ImageTable;
+    stores.binding = RuntimeAbi::StorageImageTableBinding;
+    stores.count = 2u;
+    stores.guestDescriptor = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0x123400u, 13u << 20u, 0u, 0x9000024cu, 0u, 0u, 0u, 0u};
+    stores.imageShapes = {DescriptorImageShape::Image2D, DescriptorImageShape::Image2D};
+    stores.imageWritten = {false, true};
+    stores.imageAtomic = {false, false};
+    result.bindings.push_back(std::move(stores));
     result.pushConstants = {std::byte{1}, std::byte{0xff}, std::byte{0}, std::byte{0x80}, std::byte{7}};
     result.readsDepthRemapPush = true;
     result.bdaAbiVersion = 3;
-    result.descriptorFaults = 2;
-    result.windowLaneGuards = 7u;
     result.memoryOffsetDword = 7;
     result.hostSubgroupSize = 32;
     result.fullSubgroups = true;
@@ -293,7 +291,6 @@ RecompileResult sampleResult() {
     result.stencilReferences = {0u, 17u, 255u};
     result.stencilReplaySafe = true;
     result.bdaWrites = true;
-    result.layerReplaySafe = true;
     result.stencilReferenceDword = 23u;
     result.poisonedSrtReads = 3;
     result.shaderDataUserWords = {2u, 0xffffffffu, 9u};
@@ -305,6 +302,8 @@ RecompileResult sampleResult() {
     result.imageTableReadRanges = {{{0x1000u, 32u}, {0x1040u, 32u}}, {}, {{0x5000000000ull, 16u}}};
     result.imageTableShader = 0x80003aa700ull;
     result.imageTableFaults = 3u;
+    result.hasDeferredDirectImage = true;
+    result.hasGuardedUnnormalizedWrap = true;
     result.userDataRegisterReads = (std::uint64_t{1} << 63u) | (std::uint64_t{1} << 32u) | 0x25u;
     return result;
 }
@@ -358,22 +357,17 @@ CompiledVariant sampleVariant() {
     image.flatLineCompatible = false;
     image.flatVolumeLineCompatible = false;
     image.dimensionQueryOnly = false;
-    image.sampledOnly = false;
     image.foldTexelOffsetsOnly = true;
     image.remappedDepth1D = true;
-    image.layerRowsCompatible = false;
-    image.layerRows = true;
-    image.maxArrayLayers = 0x01020304u;
-    image.optionalDescriptor = true;
     image.byElements = 4;
     image.byComponents = 1;
     image.emulatedCompare = 0x1a07u;
     image.table = 0;
     image.tableOperation = TableOperation::Unsupported;
-    image.targetMerge = true;
+    image.levelUses = ImageLevelUseQuery | ImageLevelUseMipLoad;
     info.info.images = {image};
     ResourceMaterializer::PrepareImageModes(info.info);
-    info.info.samplers = {{7, 0x10, 3, true, false, SamplerUseExplicitLod | SamplerUseGather, true, 1}};
+    info.info.samplers = {{7, 0x10, 3, true, false, SamplerUseExplicitLod | SamplerUseGather | SamplerUseNonZeroLod, true, 1}};
     info.info.usesFaultBuffer = true;
     info.info.sampledPairs = {{0, 0, 0x10}};
     StageInput input{};
@@ -401,7 +395,7 @@ CompiledVariant sampleVariant() {
     info.bindings.memoryOffsetCount = 5;
     info.bindings.stencilReferenceDword = 23u;
     info.bindings.userDataRegisters = {4, 5, 9};
-    info.bindings.descriptors = {{DescriptorBindingKind::Buffers, {0, 1}}, {DescriptorBindingKind::FlattenedSrt, {}}};
+    info.bindings.descriptors = {{DescriptorBindingKind::Buffers, {0, 1}}, {DescriptorBindingKind::FlattenedSrt, {}}, {DescriptorBindingKind::StorageImageTable, {}}};
     variant.bindings.layout = info.bindings;
     variant.bindings.pushConstantOffsetBytes = 16;
     variant.bindings.pushConstantSizeBytes = 112;
@@ -453,13 +447,6 @@ void verifyResultRoundTrip() {
     require(ShaderDiskCache::DecodeResult(bytes, decoded), "an encoded result does not decode");
     requireSameResult(result, decoded, "result round trip");
     require(decoded.variantId == 0 && !decoded.cacheHit, "the per-process fields were stored");
-    auto memoized = result;
-    memoized.drawKeyMemo.words.store(std::make_shared<const std::vector<std::uint32_t>>(std::vector<std::uint32_t>{1u, 2u, 3u}));
-    std::vector<std::byte> memoizedBytes;
-    ShaderDiskCache::EncodeResult(memoized, memoizedBytes);
-    require(memoizedBytes == bytes, "the draw key memo was stored");
-    RecompileResult memoizedDecoded;
-    require(ShaderDiskCache::DecodeResult(memoizedBytes, memoizedDecoded) && !memoizedDecoded.drawKeyMemo.words.load(), "a decoded result has a draw key memo");
     for (std::size_t size = 0; size < bytes.size(); size += size < 256 ? 1 : 97) {
         RecompileResult partial;
         require(!ShaderDiskCache::DecodeResult(std::span(bytes).first(size), partial), "a result truncated to " + std::to_string(size) + " bytes decodes");
@@ -471,11 +458,13 @@ void verifyResultRoundTrip() {
     ShaderDiskCache::EncodeResult(RecompileResult{}, bytes);
     require(ShaderDiskCache::DecodeResult(bytes, decoded), "an empty result does not decode");
     requireSameResult(RecompileResult{}, decoded, "empty result round trip");
-    auto incompatible = result;
-    incompatible.runtimeAbiVersion = RuntimeAbi::Version + 1u;
-    bytes.clear();
-    ShaderDiskCache::EncodeResult(incompatible, bytes);
-    require(!ShaderDiskCache::DecodeResult(bytes, decoded), "an incompatible runtime ABI result decodes");
+    for (const auto abi : {RuntimeAbi::Version - 1u, RuntimeAbi::Version + 1u}) {
+        auto incompatible = result;
+        incompatible.runtimeAbiVersion = abi;
+        bytes.clear();
+        ShaderDiskCache::EncodeResult(incompatible, bytes);
+        require(!ShaderDiskCache::DecodeResult(bytes, decoded), "an incompatible runtime ABI " + std::to_string(abi) + " result decodes");
+    }
 }
 
 void verifyElementFlags() {
@@ -548,10 +537,13 @@ void verifyEntryRoundTrip() {
     auto upstreamVersion = file;
     upstreamVersion[4] = std::byte{33};
     require(ShaderDiskCache::DecodeEntry(upstreamVersion, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "a stencil artifact with the upstream resource plan format loads");
-    auto incompatible = variant;
-    incompatible.artifact.runtimeAbiVersion = RuntimeAbi::Version + 1u;
-    const auto incompatibleFile = ShaderDiskCache::EncodeEntry(key, incompatible);
-    require(ShaderDiskCache::DecodeEntry(incompatibleFile, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "an entry with an incompatible runtime ABI loads");
+    for (const auto abi : {RuntimeAbi::Version - 1u, RuntimeAbi::Version + 1u}) {
+        auto incompatible = variant;
+        incompatible.artifact.runtimeAbiVersion = abi;
+        const auto incompatibleFile = ShaderDiskCache::EncodeEntry(key, incompatible);
+        require(ShaderDiskCache::DecodeEntry(incompatibleFile, key, decoded) == ShaderDiskCache::LoadStatus::Rejected,
+            "an entry with an incompatible runtime ABI " + std::to_string(abi) + " loads");
+    }
 }
 
 std::vector<std::byte> packBytes(const std::vector<std::pair<std::vector<std::byte>, std::vector<std::byte>>>& entries) {
@@ -577,62 +569,6 @@ std::vector<std::byte> packBytes(const std::vector<std::pair<std::vector<std::by
         at += entry.size();
     }
     return bytes;
-}
-
-void verifyPrebuiltPackOwnership(const std::filesystem::path& directory) {
-    using namespace ShaderRecompiler::ShaderDiskCache;
-    SampleRequest sample;
-    const auto key = sample.Key();
-    const auto variant = sampleVariant();
-    const auto path = directory / "ownership.pack";
-    require(WriteFileAtomically(path, packBytes({{key, EncodeEntry(key, variant)}})), "cannot write the ownership test pack");
-    CompiledVariant first, second;
-    PackLoadTimings timings;
-    const std::uint32_t* words = nullptr;
-    {
-        CachePack pack(path);
-        require(pack.Valid(), "the ownership test pack is invalid");
-        require(pack.Load(key, first, timings) == LoadStatus::Loaded, "cannot load the first packed variant");
-        require(pack.Load(key, second, timings) == LoadStatus::Loaded, "cannot load the second packed variant");
-        words = first.artifact.spirv.Words().data();
-        require(!first.artifact.spirv.empty() && words == second.artifact.spirv.Words().data(), "packed SPIR-V was copied instead of sharing its mapping");
-    }
-    requireSameVariant(variant, first, "packed variant outlives its pack");
-#ifdef _WIN32
-    MEMORY_BASIC_INFORMATION region{};
-    require(VirtualQuery(words, &region, sizeof(region)) == sizeof(region) && region.Type == MEM_MAPPED, "packed SPIR-V lost its mapping after pack destruction");
-#endif
-    auto edited = first.artifact.spirv;
-    edited[0] ^= 1u;
-    require(edited.Words().data() != words && edited.Words()[0] != first.artifact.spirv.Words()[0], "editing packed SPIR-V modified the shared mapping");
-    first = {};
-    requireSameVariant(variant, second, "last packed variant retains its mapping");
-    std::vector<std::byte> published;
-    require(ReadWholeFile(path, published) && published == packBytes({{key, EncodeEntry(key, variant)}}), "editing packed SPIR-V modified the cache file");
-    second = {};
-#ifdef _WIN32
-    require(VirtualQuery(words, &region, sizeof(region)) == sizeof(region) && region.State == MEM_FREE, "the final packed variant did not release its mapping");
-#endif
-    const auto offset = sizeof(PackHeader) + sizeof(PackRecord);
-    published.insert(published.begin() + offset, std::byte{});
-    PackHeader header;
-    PackRecord record;
-    std::memcpy(&header, published.data(), sizeof(header));
-    std::memcpy(&record, published.data() + sizeof(header), sizeof(record));
-    ++header.fileBytes;
-    ++record.offset;
-    std::memcpy(published.data() + sizeof(header), &record, sizeof(record));
-    header.indexHash = ShaderRecompiler::HashBytes(std::span<const std::byte>(published).subspan(sizeof(header), sizeof(record)));
-    std::memcpy(published.data(), &header, sizeof(header));
-    require(WriteFileAtomically(path, published), "cannot publish an unaligned packed entry");
-    {
-        CachePack pack(path);
-        require(pack.Valid(), "an unaligned packed entry was rejected");
-        require(pack.Load(key, first, timings) == LoadStatus::Loaded && pack.Load(key, second, timings) == LoadStatus::Loaded, "an unaligned packed entry did not load");
-        require(first.artifact.spirv.Words().data() != second.artifact.spirv.Words().data(), "an unaligned packed module did not use aligned owned storage");
-    }
-    requireSameVariant(variant, first, "unaligned packed variant outlives its pack");
-    requireSameVariant(variant, second, "second unaligned packed variant outlives its pack");
 }
 
 void refreshIndexHash(std::vector<std::byte>& pack, std::size_t entries) {
@@ -841,29 +777,6 @@ void verifyMeshBarycentricRequestSerialization() {
     }
 }
 
-void verifyHashBytes() {
-    constexpr std::array<std::array<std::uint64_t, 3>, 8> expected{{
-        {0u, 0x840bc8c130ceedb6ull, 0x7e0452fcbd09083dull},
-        {1u, 0x2bb08a6e94d5ffabull, 0xe3641007415d06d1ull},
-        {7u, 0xd0ec3c76aa3e2e44ull, 0x345f41799c18a2b1ull},
-        {8u, 0xa0c4caa4a9025c5aull, 0xa3829d1fdbcf4aebull},
-        {9u, 0x5976a0604c948110ull, 0xeaeed8d5500a97a2ull},
-        {15u, 0x55bbcd3fcf37abd7ull, 0x420b82b607b1d4f9ull},
-        {16u, 0x731681f2dbac64e8ull, 0x4a9c1f25580b95a4ull},
-        {17u, 0x31a156cfac950b79ull, 0xac0b4579d052a463ull},
-    }};
-    std::array<std::byte, 17> bytes{};
-    for (std::size_t index = 0; index < bytes.size(); ++index) bytes[index] = static_cast<std::byte>(index);
-    for (const auto& sample : expected) {
-        const auto input = std::span<const std::byte>(bytes).first(sample[0]);
-        const auto hashes = ShaderRecompiler::ShaderDiskCache::PackKeyHash(input);
-        require(hashes == std::array{sample[1], sample[2]}, "paired cache hashes changed");
-        require(ShaderRecompiler::HashBytes(input, 0x5eed0001ull) == sample[1] && ShaderRecompiler::HashBytes(input, 0x5eed0002ull) == sample[2], "scalar cache hashes changed");
-    }
-    require(ShaderRecompiler::HashBytes({}) == 0u, "empty cache checksum changed");
-    require(ShaderRecompiler::ShaderDiskCache::EntryName(bytes) == "31a156cfac950b79ac0b4579d052a463.bin", "cache entry name changed");
-}
-
 void verifyKeySensitivity() {
     SampleRequest base;
     const auto key = base.Key();
@@ -909,11 +822,8 @@ void verifyKeySensitivity() {
     changes("f32 denormal preservation", [](SampleRequest& sample) { sample.request.target.float32DenormPreserve = true; });
     changes("spanned waves", [](SampleRequest& sample) { sample.request.target.spannedWaves = true; });
     changes("robust buffer access 2", [](SampleRequest& sample) { sample.request.target.robustBufferAccess2 = true; });
-    changes("exact robust loads", [](SampleRequest& sample) { sample.request.target.exactRobustLoads = true; });
     changes("wave LDS memory barriers", [](SampleRequest& sample) { sample.request.target.waveLdsMemoryBarriers = true; });
     changes("device-scope LDS memory barriers", [](SampleRequest& sample) { sample.request.target.deviceScopeLdsMemoryBarriers = true; });
-    changes("LDS lock fences", [](SampleRequest& sample) { sample.request.target.ldsLockFences = true; });
-    changes("mesh window buffers", [](SampleRequest& sample) { sample.request.target.meshWindowBuffer = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
     changes("the invocation limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupInvocations = 512; });
     changes("the shared memory limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSharedMemoryBytes = 32768; });
@@ -1047,14 +957,14 @@ int runLargeFileWrite() {
     } cleanup{directory};
     const auto space = std::filesystem::space(directory, error);
     if (error || space.available < size + (std::uintmax_t{1} << 30u)) {
-        std::cout << "skipped, the host has not enough free disk space for a file of more than 2 GiB\n";
+        std::cout << "skipping: not enough free disk space for a file of more than 2 GiB\n";
         return 77;
     }
     std::vector<std::byte> bytes;
     try {
         bytes.resize(size);
     } catch (const std::bad_alloc&) {
-        std::cout << "skipped, the host cannot allocate a buffer of more than 2 GiB\n";
+        std::cout << "skipping: cannot allocate a buffer of more than 2 GiB\n";
         return 77;
     }
     const std::array<std::size_t, 6> samples{0u, (std::size_t{1} << 30u) - 1u, std::size_t{1} << 30u, (std::size_t{2} << 30u) - 1u, std::size_t{2} << 30u, size - 1u};
@@ -1076,15 +986,7 @@ int runLargeFileWrite() {
         std::cerr.flush();
         std::_Exit(1);
     }
-    if (!result.get()) {
-        std::error_code spaceError;
-        const auto after = std::filesystem::space(directory, spaceError);
-        if (!spaceError && after.available < size) {
-            std::cout << "skipped, the disk filled up while the file was written: " << after.available << " bytes free afterwards, " << space.available << " before\n";
-            return 77;
-        }
-        require(false, "cannot write a cache file of more than 2 GiB (" + std::to_string(space.available) + " bytes free before, " + (spaceError ? spaceError.message() : std::to_string(after.available) + " bytes free after") + ")");
-    }
+    require(result.get(), "cannot write a cache file of more than 2 GiB");
     require(std::filesystem::file_size(path) == size, "the cache file of more than 2 GiB has the wrong size");
     {
         std::ifstream file(path, std::ios::binary);
@@ -1156,13 +1058,6 @@ void verifyAtomicReplacement(const std::filesystem::path& directory) {
         std::vector<std::byte> bytes;
         require(ReadWholeFile(path, bytes) && bytes == original, "cache reader failed while the published entry retained its rename handle");
     }
-    if (PosixReplaceUnsupported(root)) {
-        std::fprintf(stderr, "shader disk cache: %s has no POSIX rename (ERROR_INVALID_PARAMETER), so an entry another reader holds open cannot be replaced there; skipping that case\n", root.string().c_str());
-        require(std::filesystem::remove(path), "cannot remove the cache entry");
-        require(std::filesystem::is_empty(root), "atomic replacement left a temporary file behind");
-        require(std::filesystem::remove(root), "cannot remove the empty replacement directory");
-        return;
-    }
 #endif
     {
         Reader old(path);
@@ -1200,12 +1095,6 @@ void verifyStore() {
 
     std::vector<std::byte> file;
     require(ReadWholeFile(path, file), "cannot read the entry back");
-#ifdef _WIN32
-    if (PosixReplaceUnsupported(path.parent_path())) {
-        std::fprintf(stderr, "shader disk cache: %s has no POSIX rename (ERROR_INVALID_PARAMETER), so the entry the cache has mapped cannot be replaced there; skipping the damaged-entry checks\n", path.parent_path().string().c_str());
-        return;
-    }
-#endif
     require(WriteFileAtomically(path, std::span(file).first(file.size() / 2)), "cannot truncate the entry");
     require(!ShaderDiskCache::Load(key, loaded), "a truncated entry loads");
     auto corrupt = file;
@@ -1241,12 +1130,6 @@ void verifyPersist() {
     auto detached = persisted->artifact.spirv;
     detached[0] ^= 1u;
     require(detached[0] != persisted->artifact.spirv[0], "changing a copied mapped module changed its owner");
-#ifdef _WIN32
-    if (PosixReplaceUnsupported(path.parent_path())) {
-        std::fprintf(stderr, "shader disk cache: %s has no POSIX rename (ERROR_INVALID_PARAMETER), so a mapped persisted entry cannot be replaced there; skipping that check\n", path.parent_path().string().c_str());
-        return;
-    }
-#endif
     require(WriteFileAtomically(path, std::vector<std::byte>(64, std::byte{0x5a})), "cannot replace the persisted entry");
     std::error_code error;
     std::filesystem::remove(path, error);
@@ -1357,6 +1240,478 @@ void verifyAcrossProcesses(const char* self) {
     require(!compiled.spirv.empty(), "the compile produced no SPIR-V");
     const std::string command = "\"" + std::string(self) + "\" --load";
     require(std::system(command.c_str()) == 0, "the loading process failed");
+    for (const auto* mode : {"--load-lazy-plan", "--load-eager-plan"}) {
+        const std::string planCommand = "\"" + std::string(self) + "\" " + mode;
+        require(std::system(planCommand.c_str()) == 0, std::string(mode) + " process failed");
+    }
+}
+
+class DirectImageCacheLoopGuard {
+public:
+    explicit DirectImageCacheLoopGuard(const char* value, const char* variable = "APS5_LOOP_GUARD") : name(variable) {
+        if (const auto* current = std::getenv(name)) { present = true; previous = current; }
+        Set(value);
+    }
+    ~DirectImageCacheLoopGuard() { Set(present ? previous.c_str() : nullptr); }
+private:
+    void Set(const char* value) {
+        if (value != nullptr) setEnvironment(name, value);
+        else {
+#ifdef _WIN32
+            _putenv_s(name, "");
+#else
+            unsetenv(name);
+#endif
+        }
+        ShaderRecompiler::RefreshEnvironmentGuards();
+    }
+    bool present = false;
+    std::string previous;
+    const char* name;
+};
+
+class PlanIrCapture {
+public:
+    PlanIrCapture() {
+        std::fflush(stderr);
+        file = std::tmpfile();
+        require(file != nullptr, "lazy plan: cannot create IR capture");
+#ifdef _WIN32
+        saved = _dup(_fileno(stderr));
+        const auto redirected = saved < 0 ? -1 : _dup2(_fileno(file), _fileno(stderr));
+#else
+        saved = dup(fileno(stderr));
+        const auto redirected = saved < 0 ? -1 : dup2(fileno(file), fileno(stderr));
+#endif
+        if (redirected < 0) {
+            Restore();
+            std::fclose(file);
+            file = nullptr;
+            throw std::runtime_error("lazy plan: cannot redirect IR capture");
+        }
+    }
+    ~PlanIrCapture() {
+        if (file != nullptr) { Restore(); std::fclose(file); }
+    }
+    std::string Finish() {
+        Restore();
+        std::rewind(file);
+        std::string text;
+        std::array<char, 4096> buffer{};
+        for (std::size_t read = 0; (read = std::fread(buffer.data(), 1, buffer.size(), file)) != 0;) text.append(buffer.data(), read);
+        const bool failed = std::ferror(file) != 0;
+        std::fclose(file);
+        file = nullptr;
+        require(!failed, "lazy plan: cannot read IR capture");
+        return text;
+    }
+private:
+    void Restore() {
+        std::fflush(stderr);
+        if (saved < 0) return;
+#ifdef _WIN32
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+#else
+        dup2(saved, fileno(stderr));
+        close(saved);
+#endif
+        saved = -1;
+    }
+    std::FILE* file = nullptr;
+    int saved = -1;
+};
+
+std::size_t planTranslations(std::string_view text) {
+    std::size_t count = 0;
+    for (std::size_t cursor = 0; (cursor = text.find(" after translate", cursor)) != std::string_view::npos; ++cursor) ++count;
+    return count;
+}
+
+void verifyLatePlanFailure(bool eager) {
+    ComputeRequest sample(true);
+    sample.code = {0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u,
+        0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u,
+        0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    sample.request.shader = {ShaderStage::Compute, 0xabc58100u, sample.code, 0, {}};
+    sample.request.context.waveSize = 32;
+    sample.request.context.compute->numThreads = {32u, 1u, 1u};
+    sample.request.context.userData = std::span(sample.userData).first(2);
+    sample.capabilities[0] = 29u;
+    const auto fail = [&] {
+        try { static_cast<void>(PrepareShader(sample.request)); }
+        catch (const std::runtime_error& error) { return std::string(error.what()); }
+        throw std::runtime_error("lazy plan: unsupported descriptor Phi was accepted");
+    };
+    const auto before = ShaderDiskCache::Totals();
+    PlanIrCapture trace;
+    const auto expected = fail();
+    require(expected.find("GetSamplerResource dword 0 is not a valid runtime value") != std::string::npos, "lazy plan: wrong late planning failure: " + expected);
+    require(fail() == expected, "lazy plan: repeated planning failure changed");
+    std::barrier start(4);
+    std::latch launchReady(1);
+    bool launchFailed = false;
+    std::array<std::future<std::string>, 4> failures;
+    try {
+        for (auto& failure : failures) failure = std::async(std::launch::async, [&] {
+            launchReady.wait();
+            if (launchFailed) return std::string{};
+            start.arrive_and_wait();
+            return fail();
+        });
+    } catch (...) {
+        launchFailed = true;
+        launchReady.count_down();
+        throw;
+    }
+    launchReady.count_down();
+    for (auto& failure : failures) require(failure.get() == expected, "lazy plan: concurrent planning failure changed");
+    const auto ir = trace.Finish();
+    require(planTranslations(ir) == 1u && ir.find(" after fold") != std::string::npos,
+        "lazy plan: late failure was not memoized after translation/folding: " + ir);
+    ShaderDiskCache::Flush();
+    const auto after = ShaderDiskCache::Totals();
+    require(after.misses == before.misses + (eager ? 0u : 1u) && after.hits == before.hits && after.writes == before.writes,
+        "lazy plan: failed planning repeated disk lookup or stored an artifact");
+    std::cout << "late plan failure: one frontend, repeated/concurrent identical refusal, no cache store\n";
+}
+
+int runLazyPlanLoadingProcess(bool eager) {
+    DirectImageCacheLoopGuard mode(eager ? "0" : nullptr, "APS5_NO_PERF_LAZY_CAPTURE_PLAN");
+    DirectImageCacheLoopGuard memo(nullptr, "APS5_NO_FAILURE_MEMO");
+    DirectImageCacheLoopGuard dump("all", "APS5_DUMP_IR");
+    ComputeRequest registered(true);
+    PlanIrCapture preparationTrace;
+    const auto handle = PrepareShader(registered.request);
+    const auto preparationIr = preparationTrace.Finish();
+    const auto totals = ShaderDiskCache::Totals();
+    require(totals.hits == 1u && totals.misses == 0u && totals.loadFailures == 0u, "lazy plan: preparation did not verify a disk hit");
+    require(planTranslations(preparationIr) == (eager ? 1u : 0u), "lazy plan: wrong warm preparation frontend count: " + preparationIr);
+    std::array<std::unique_ptr<ComputeRequest>, 4> current;
+    std::array<std::shared_ptr<const ResourceCapture>, 4> captures;
+    std::array<std::shared_ptr<const RecompileResult>, 4> results;
+    std::array<std::future<void>, 4> workers;
+    std::barrier start(4);
+    std::latch launchReady(1);
+    bool launchFailed = false;
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        current[index] = std::make_unique<ComputeRequest>(true);
+        current[index]->request.shader.codeAddress = 0x30000u;
+        current[index]->userData[0] += static_cast<std::uint32_t>(index + 1u) * 0x10000u;
+        current[index]->userData[2] += static_cast<std::uint32_t>(index) * 16u;
+    }
+    PlanIrCapture captureTrace;
+    try {
+        for (std::size_t index = 0; index < current.size(); ++index) {
+            workers[index] = std::async(std::launch::async, [&, index] {
+                launchReady.wait();
+                if (launchFailed) return;
+                start.arrive_and_wait();
+                const auto& request = current[index]->request;
+                const auto invocation = PreparedShaderInvocation::TryCreate(request, handle);
+                require(invocation.has_value(), "lazy plan: relocated invocation did not match the loaded artifact");
+                SrtRuntime runtime{};
+                runtime.userData = current[index]->userData;
+                runtime.shaderBase = request.shader.codeAddress;
+                captures[index] = index % 2u == 0u ? invocation->Capture(runtime) : CaptureResources(request, runtime, *handle);
+                results[index] = index % 2u == 0u ? invocation->Materialize(*captures[index]) : MaterializeShader(request, *captures[index], *handle);
+            });
+        }
+    } catch (...) {
+        launchFailed = true;
+        launchReady.count_down();
+        throw;
+    }
+    launchReady.count_down();
+    for (auto& worker : workers) worker.get();
+    const auto captureIr = captureTrace.Finish();
+    require(planTranslations(captureIr) == (eager ? 0u : 1u), "lazy plan: concurrent first capture did not build exactly one plan: " + captureIr);
+    PlanIrCapture repeatedTrace;
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        const auto& snapshot = captures[index]->snapshot;
+        require(captures[index]->plan == captures[0]->plan && captures[index]->plan->shaderHash == registered.request.shader.codeAddress,
+            "lazy plan: concurrent or relocated capture changed source-plan identity");
+        require(snapshot.buffers.size() == 1u && snapshot.buffers[0].dwordCount == 4u
+            && std::equal(current[index]->userData.begin(), current[index]->userData.end(), snapshot.buffers[0].dwords.begin()),
+            "lazy plan: capture reused another invocation's descriptor words");
+        SrtRuntime runtime{};
+        runtime.userData = current[index]->userData;
+        runtime.shaderBase = current[index]->request.shader.codeAddress;
+        const auto repeated = CaptureResources(current[index]->request, runtime, *handle);
+        require(repeated->plan == captures[0]->plan, "lazy plan: repeated capture replaced the plan");
+        requireSameResult(*results[index], *MaterializeShader(current[index]->request, *repeated, *handle), "lazy plan repeated capture");
+    }
+    const auto repeatedIr = repeatedTrace.Finish();
+    require(planTranslations(repeatedIr) == 0u, "lazy plan: repeated capture reran the frontend: " + repeatedIr);
+    for (std::size_t index = 0; index < current.size(); ++index) {
+        current[index]->request.useCache = false;
+        requireSameResult(Recompile(current[index]->request), *results[index], "lazy plan current descriptor against uncached compile");
+    }
+    std::cout << (eager ? "eager" : "lazy") << " verified disk hit: preparation frontend=" << planTranslations(preparationIr)
+        << ", first concurrent capture frontend=" << planTranslations(captureIr) << ", repeated=0; origin 0x20000, capture 0x30000, four exact current descriptors\n";
+    verifyLatePlanFailure(eager);
+    return 0;
+}
+
+void verifyUnnormalizedWrapTransitions(bool coldLoopOnly = false) {
+    DirectImageCacheLoopGuard noLoop(coldLoopOnly ? "8" : nullptr);
+    DirectImageCacheLoopGuard policy("0", "APS5_UNNORM_WRAP_GUARD");
+    ComputeRequest sample(true);
+    sample.code = {0x7e0402ffu, 0x3f000000u, 0x7e0602ffu, 0x3f000000u, 0xf09c0108u, 0x00610802u, 0xe0700000u, 0x80000800u, 0xbf810000u};
+    std::array<std::uint32_t, 20> users{0x10000000u, 0u, 256u, 0x00027facu,
+        0x20000000u, 0x00700000u, 0x815fc15fu, 0x9050024cu, 0u, 0u, 0u, 0u,
+        0x00008000u, 0x00fff000u, 0x05000000u, 0u};
+    sample.request.shader = {ShaderStage::Compute, 0xabc57000u, sample.code, 0, {}};
+    sample.request.context.userData = users;
+    SrtRuntime runtime{};
+    runtime.userData = users;
+    if (coldLoopOnly) {
+        sample.code.insert(sample.code.begin(), 0xbe900382u);
+        sample.code.insert(sample.code.end() - 1, {0x80908110u, 0xbf068010u, 0xbf84fff5u, 0x7e3c0280u, 0xdc708000u, 0x0012081eu});
+        users[18] = 0x30000000u;
+        sample.request.shader = {ShaderStage::Compute, 0xabc57300u, sample.code, 0, {}};
+        const auto loopArtifact = PrepareShader(sample.request);
+        require(GetPreparedArtifact(*loopArtifact).bdaAbiVersion == BdaAbi::Version, "loop artifact lacks its independent fault interface");
+        DirectImageCacheLoopGuard cleared(nullptr);
+        setEnvironment("APS5_UNNORM_WRAP_GUARD", "1");
+        bool refused = false;
+        try { static_cast<void>(MaterializeShader(sample.request, *CaptureResources(sample.request, runtime, *loopArtifact), *loopArtifact)); }
+        catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "unnormalized wrap requires emitted per-sampler guard proof"; }
+        require(refused, "loop artifact's fault buffer was mistaken for emitted wrap capability after clearing the loop guard");
+        std::cout << "cold loop artifact: independent BDA1 cannot replace wrap capability after clearing policy\n";
+        return;
+    }
+    const auto handle = PrepareShader(sample.request);
+    const auto capture = CaptureResources(sample.request, runtime, *handle);
+    const auto materialize = [&] { return MaterializeShader(sample.request, *capture, *handle); };
+    const auto hasFault = [](const auto& result) { return std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == DescriptorRole::FaultBuffer; }); };
+    const auto off = materialize();
+    require(!off->hasGuardedUnnormalizedWrap && !hasFault(*off), "disabled wrap retained a guard or fault completion");
+    setEnvironment("APS5_UNNORM_WRAP_GUARD", "1");
+    const auto on = materialize();
+    require(on->hasGuardedUnnormalizedWrap && hasFault(*on) && on->PipelineVariantId() != off->PipelineVariantId(), "wrap policy reused the disabled result memo");
+    require(materialize() == on, "enabled wrap did not reuse its result memo");
+    {
+        DirectImageCacheLoopGuard loop("8");
+        bool refused = false;
+        try { static_cast<void>(materialize()); }
+        catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "unnormalized wrap requires a compute fault buffer without a loop guard"; }
+        require(refused, "enabled loop guard reused the guarded wrap result memo");
+    }
+    require(materialize() == on, "clearing loop guard lost the valid wrap result memo");
+    sample.request.target.bdaAbiVersion = 0u;
+    bool abiRefused = false;
+    try { static_cast<void>(materialize()); }
+    catch (const std::runtime_error& error) { abiRefused = std::string_view(error.what()) == "ShaderRecompiler: prepared artifact does not match the static ABI"; }
+    require(abiRefused, "changed request ABI reused the guarded wrap result memo");
+    sample.request.target.bdaAbiVersion = BdaAbi::Version;
+    setEnvironment("APS5_UNNORM_WRAP_GUARD", "0");
+    require(materialize() == off, "disabling wrap reused the enabled result memo");
+    setEnvironment("APS5_UNNORM_WRAP_GUARD", "1");
+    for (const auto word : {0x12u, 0x8012u}) {
+        users[12] = word;
+        const auto ordinary = MaterializeShader(sample.request, *CaptureResources(sample.request, runtime, *handle), *handle);
+        require(!ordinary->hasGuardedUnnormalizedWrap && !hasFault(*ordinary), "normalized or clamp sampling retained wrap fault completion");
+    }
+    users[12] = 0x8000u;
+    sample.code[4] = 0xf0900108u;
+    sample.request.shader.codeAddress += 0x100u;
+    bool refused = false;
+    try {
+        const auto unsupported = PrepareShader(sample.request);
+        static_cast<void>(MaterializeShader(sample.request, *CaptureResources(sample.request, runtime, *unsupported), *unsupported));
+    }
+    catch (const std::runtime_error& error) { refused = std::string_view(error.what()) == "unnormalized wrap requires emitted per-sampler guard proof"; }
+    require(refused, "non-LZ artifact was accepted without emitted wrap capability");
+    std::cout << "unnormalized wrap: policy/result memo, loop guard, pruning and missing capability controls passed\n";
+}
+
+struct DirectImageCacheRequest : ComputeRequest {
+    std::array<std::uint32_t, 12> imageUsers{0x00010000u, 56u << 20u, 0u, 0xd0000facu};
+    std::array<std::uint32_t, 6> imageCapabilities{spv::CapabilityShader, spv::CapabilityInt64,
+        spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess,
+        spv::CapabilityStorageImageWriteWithoutFormat, spv::CapabilityStorageImageExtendedFormats};
+
+    explicit DirectImageCacheRequest(bool loop = false) : ComputeRequest(true) {
+        code = {0x7e3c0280u, 0x7e3e0280u, 0x7e400280u, 0x7e2802ffu, 0x3f800000u,
+            0x7e2a0280u, 0x7e2c0280u, 0x7e2e02ffu, 0x3f800000u, 0xbf068008u, 0xbf850000u};
+        const auto skip = code.size() - 1u;
+        if (loop) code.push_back(0xbe890382u);
+        const auto loopStart = code.size();
+        code.insert(code.end(), {0xf0202f28u, 0x0000141eu});
+        if (loop) {
+            code.insert(code.end(), {0x80898109u, 0xbf068009u, 0xbf840000u});
+            code.back() |= static_cast<std::uint16_t>(static_cast<std::int32_t>(loopStart) - static_cast<std::int32_t>(code.size()));
+        }
+        code[skip] |= static_cast<std::uint32_t>(code.size() - skip - 1u);
+        if (loop) {
+            code.insert(code.end(), {0xdc708000u, 0x000a141eu});
+            imageUsers[10] = 0x20000000u;
+        }
+        code.push_back(0xbf810000u);
+        request.shader = {ShaderStage::Compute, loop ? 0xd1aec7200ull : 0xd1aec7100ull, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userData = imageUsers;
+        request.context.compute = ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 1};
+        request.target.supportedCapabilities = imageCapabilities;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+    }
+    void Descriptor(bool valid) { imageUsers[3] = (valid ? 0xd0000000u : 0x80000000u) | 0xfacu; }
+    std::shared_ptr<const ResourceCapture> Capture(const SourceHandle& handle) const {
+        SrtRuntime runtime{};
+        runtime.userData = imageUsers;
+        return CaptureResources(request, runtime, handle);
+    }
+    std::shared_ptr<const RecompileResult> Materialize(const SourceHandle& handle) const {
+        return MaterializeShader(request, *Capture(handle), handle);
+    }
+};
+
+bool hasDirectImageRefusalCase(const CompiledShaderArtifact& artifact) {
+    for (std::size_t offset = 5; offset < artifact.spirv.size();) {
+        const auto words = artifact.spirv[offset] >> 16u;
+        require(words != 0 && offset + words <= artifact.spirv.size(), "direct image disk fixture has malformed SPIR-V");
+        if ((artifact.spirv[offset] & 0xffffu) == spv::OpSwitch) {
+            for (std::size_t word = 3; word + 1 < words; word += 2) {
+                if (artifact.spirv[offset + word] == PipelineSpecialization::DeferredDirectImageMode) return true;
+            }
+        }
+        offset += words;
+    }
+    return false;
+}
+
+void verifyDirectImageSelection(const RecompileResult& result, bool valid) {
+    std::size_t writes = 0;
+    for (std::size_t offset = 5; offset < result.spirv.size(); offset += result.spirv[offset] >> 16u) {
+        writes += (result.spirv[offset] & 0xffffu) == spv::OpImageWrite;
+    }
+    std::size_t images = 0;
+    for (const auto& binding : result.bindings) if (binding.role == DescriptorRole::GuestImages) images += binding.count;
+    require(writes == (valid ? 1u : 0u) && images == (valid ? 1u : 0u), "direct image disk invocation retained the wrong image accesses or bindings");
+    require(std::ranges::all_of(result.specialization, [](const PipelineSpecializationConstant& constant) { return PipelineSpecialization::IsWorkgroupOffset(constant.id) && constant.value == 0u; }) && result.hasDeferredDirectImage == !valid,
+        "direct image disk invocation lost its valid/refused completion distinction");
+    if (!valid) require(result.bdaAbiVersion == BdaAbi::Version && std::any_of(result.bindings.begin(), result.bindings.end(), [](const auto& binding) {
+        return binding.role == DescriptorRole::FaultBuffer;
+    }), "direct image disk refusal has no recognized fault-buffer ABI");
+}
+
+void directImageCpuRefusal(const std::function<void()>& action, const char* what) {
+    try { action(); }
+    catch (const std::exception& error) {
+        const std::string message = error.what();
+        require(message.find("incompatible with the static runtime image interface") != std::string::npos,
+            std::string(what) + ": unexpected refusal: " + error.what());
+        return;
+    }
+    throw std::runtime_error(std::string(what) + ": incompatible image escaped CPU refusal");
+}
+
+void verifyDirectImageCacheTransitions(DirectImageCacheRequest& sample, const SourceHandle& handle) {
+    const auto& artifact = GetPreparedArtifact(handle);
+    require(artifact.bdaAbiVersion == BdaAbi::Version && artifact.runtimeAbiVersion == RuntimeAbi::Version && hasDirectImageRefusalCase(artifact),
+        "direct image disk artifact was not prepared with refusal capability");
+    std::shared_ptr<const RecompileResult> firstValid;
+    std::shared_ptr<const RecompileResult> firstRefused;
+    for (const bool valid : {true, false, true}) {
+        sample.Descriptor(valid);
+        for (const auto flag : {0u, 1u, 0u}) {
+            sample.imageUsers[8] = flag;
+            const auto result = sample.Materialize(handle);
+            require(result->cacheHit && result->variantId == artifact.variantId, "direct image disk transition replaced the prepared artifact");
+            verifyDirectImageSelection(*result, valid);
+            if (valid) require(result->bdaAbiVersion == 0 && std::none_of(result->bindings.begin(), result->bindings.end(), [](const auto& binding) {
+                return binding.role == DescriptorRole::FaultBuffer;
+            }), "valid image-only disk invocation retained unnecessary fault completion");
+            auto& first = valid ? firstValid : firstRefused;
+            if (first == nullptr) first = result;
+            else require(result->PipelineVariantId() == first->PipelineVariantId() && result->specialization == first->specialization
+                && result->spirv == first->spirv,
+                "direct image disk transition keyed or folded the runtime branch flag");
+            if (flag != 0) require(result->pushConstants != first->pushConstants || !sameBindings(result->bindings, first->bindings),
+                "direct image disk invocation failed to capture the changed runtime branch flag");
+        }
+    }
+    require(firstValid->PipelineVariantId() != firstRefused->PipelineVariantId(), "direct image disk valid/refused specializations collided");
+    sample.Descriptor(false);
+    const auto cachedCapture = sample.Capture(handle);
+    {
+        DirectImageCacheLoopGuard guarded("8");
+        directImageCpuRefusal([&] { static_cast<void>(sample.Capture(handle)); }, "warm disk artifact capture with loop guard");
+        directImageCpuRefusal([&] { static_cast<void>(MaterializeShader(sample.request, *cachedCapture, handle)); }, "warm disk result memo with loop guard");
+    }
+    verifyDirectImageSelection(*sample.Materialize(handle), false);
+    sample.Descriptor(true);
+    requireSameResult(*firstValid, *sample.Materialize(handle), "direct image disk valid descriptor restored after guard");
+}
+
+int runDirectImageLoadingProcess(std::string_view mode) {
+    const bool guardedArtifact = mode == "--load-guarded-direct-image";
+    const bool guardedNow = guardedArtifact || mode == "--load-direct-image-loop-guard";
+    DirectImageCacheRequest sample(guardedArtifact);
+    {
+        DirectImageCacheLoopGuard baseline(nullptr);
+        std::vector<std::byte> baselineKey;
+        ShaderDiskCache::BuildKey(sample.request, sample.request.target.subgroupSize, baselineKey);
+    }
+    std::shared_ptr<const SourceHandle> handle;
+    {
+        DirectImageCacheLoopGuard guard(guardedNow ? "8" : nullptr);
+        handle = PrepareShader(sample.request);
+        require(GetPreparedArtifact(*handle).bdaAbiVersion == BdaAbi::Version, "direct image loaded artifact lost its recognized BDA ABI");
+        const auto loaded = ShaderDiskCache::Totals();
+        require(loaded.hits == 1 && loaded.misses == 0 && loaded.loadFailures == 0 && loaded.writes == 0,
+            "direct image child did not load exactly one serialized artifact without recompiling");
+        require(sample.Materialize(*handle)->cacheHit, "direct image child did not reuse its loaded artifact");
+        if (guardedNow) {
+            sample.Descriptor(false);
+            directImageCpuRefusal([&] { static_cast<void>(sample.Materialize(*handle)); }, "cold child loading with loop guard");
+        } else verifyDirectImageCacheTransitions(sample, *handle);
+    }
+    if (guardedArtifact) {
+        DirectImageCacheLoopGuard disabled(nullptr);
+        require(!hasDirectImageRefusalCase(GetPreparedArtifact(*handle)), "guarded disk artifact unexpectedly contains a refusal arm");
+        directImageCpuRefusal([&] { static_cast<void>(sample.Materialize(*handle)); }, "guarded disk artifact after loop guard is cleared");
+        sample.Descriptor(true);
+        verifyDirectImageSelection(*sample.Materialize(*handle), true);
+    }
+    ShaderDiskCache::Flush();
+    const auto after = ShaderDiskCache::Totals();
+    require(after.hits == 1 && after.misses == 0 && after.writes == 0 && after.loadFailures == 0,
+        "direct image child transitions reloaded or rewrote the serialized artifact");
+    std::cout << mode << ": loaded one artifact, no compile or write, cache transitions passed\n";
+    return 0;
+}
+
+[[maybe_unused]] void verifyDirectImageAcrossProcesses(const char* self) {
+    DirectImageCacheLoopGuard disabled(nullptr);
+    DirectImageCacheRequest sample;
+    const auto before = ShaderDiskCache::Totals();
+    const auto handle = PrepareShader(sample.request);
+    verifyDirectImageCacheTransitions(sample, *handle);
+    ShaderDiskCache::Flush();
+    const auto normal = ShaderDiskCache::Totals();
+    require(normal.misses == before.misses + 1 && normal.writes == before.writes + 1 && normal.hits == before.hits,
+        "direct image cold artifact was not compiled and serialized exactly once");
+    DirectImageCacheRequest guardedSample(true);
+    std::shared_ptr<const SourceHandle> guardedHandle;
+    {
+        DirectImageCacheLoopGuard guard("8");
+        guardedHandle = PrepareShader(guardedSample.request);
+        require(GetPreparedArtifact(*guardedHandle).bdaAbiVersion == BdaAbi::Version, "guarded artifact must retain its independent BDA fault buffer");
+        require(!hasDirectImageRefusalCase(GetPreparedArtifact(*guardedHandle)), "cold guarded artifact acquired refusal capability");
+        guardedSample.Descriptor(false);
+        directImageCpuRefusal([&] { static_cast<void>(guardedSample.Materialize(*guardedHandle)); }, "cold compiled artifact with loop guard");
+    }
+    directImageCpuRefusal([&] { static_cast<void>(guardedSample.Materialize(*guardedHandle)); }, "cold guarded artifact after clearing loop guard");
+    ShaderDiskCache::Flush();
+    const auto guarded = ShaderDiskCache::Totals();
+    require(guarded.misses == normal.misses + 1 && guarded.writes == normal.writes + 1 && guarded.hits == normal.hits,
+        "guarded direct image artifact was not compiled and serialized exactly once");
+    for (const auto* mode : {"--load-direct-image-refusal", "--load-direct-image-loop-guard", "--load-guarded-direct-image"}) {
+        const std::string command = "\"" + std::string(self) + "\" " + mode;
+        require(std::system(command.c_str()) == 0, std::string("direct image loading process failed: ") + mode);
+    }
 }
 
 struct ClockRequest {
@@ -1503,6 +1858,36 @@ void verifyInvocationIsolation() {
     require(rejected, "an unsupported buffer descriptor type was accepted");
 }
 
+void verifyResultMemoBudget() {
+    ComputeRequest request(true);
+    const auto handle = PrepareShader(request.request);
+    const auto materialize = [&](std::uint32_t address) {
+        request.userData[0] = address;
+        SrtRuntime runtime{};
+        runtime.userData = request.userData;
+        return MaterializeShader(request.request, *CaptureResources(request.request, runtime, *handle), *handle);
+    };
+    const auto budget = ResultMemoSourceBytes();
+    const auto first = materialize(0x10000000u);
+    require(materialize(0x10000000u) == first, "the result memo did not reuse a result within its budget");
+    const auto before = ResultMemoTotals();
+    SetResultMemoSourceBytes(1u);
+    const auto second = materialize(0x10010000u);
+    const auto after = ResultMemoTotals();
+    require(after.evictions == before.evictions + 1u && after.evictedBytes - before.evictedBytes == ResultHeapBytes(*first) && after.entries == before.entries, "a source over its result memo budget did not evict exactly its older result");
+    const auto again = materialize(0x10000000u);
+    require(again != first, "an evicted result was still served from the memo");
+    requireSameResult(*first, *again, "a result rematerialized after its memo eviction");
+    require(materialize(0x10000000u) == again, "the budget evicted the newest result");
+    require(materialize(0x10010000u) != second, "a result evicted under the budget was still served from the memo");
+    SetResultMemoSourceBytes(budget);
+    bool refused = false;
+    try { SetResultMemoSourceBytes(0u); }
+    catch (const std::invalid_argument&) { refused = true; }
+    require(refused && ResultMemoSourceBytes() == budget, "a zero result memo budget was accepted");
+    std::cout << "result memo: per-source byte budget evicts older results, rematerializes them exactly and keeps the newest\n";
+}
+
 void verifyBufferAlignmentSpecialization() {
     ComputeRequest request(true);
     request.request.context.waveSize = 32u;
@@ -1534,6 +1919,81 @@ void verifyBufferAlignmentSpecialization() {
     request.userData[0] = 0x10000000u;
     const auto restored = Recompile(request.request);
     require(restored.spirv.data() == aligned.spirv.data(), "unaligned buffers replaced the aligned specialization");
+}
+
+struct PresenceRequest : ComputeRequest {
+    std::vector<std::uint32_t> presenceCode{0xe0700010u, 0x80000000u, 0xbf800005u, 0xbf810000u};
+
+    explicit PresenceRequest(const std::array<std::uint32_t, 4>& descriptor) : ComputeRequest(true) {
+        request.shader.code = presenceCode;
+        userData = descriptor;
+        request.context.userData = userData;
+    }
+};
+
+constexpr std::array<std::uint32_t, 4> PresenceBound{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
+constexpr std::array<std::uint32_t, 4> PresenceNull{0x00000000u, 0x00080050u, 0x00000000u, 0x00005204u};
+
+std::vector<std::uint32_t> spirvWords(const RecompileResult& result) {
+    require(!result.spirv.empty(), "the result has no SPIR-V");
+    return result.spirv.Copy();
+}
+
+std::filesystem::path presenceReference() {
+    return ShaderDiskCache::EntryDirectory() / "presence-reference.spv";
+}
+
+std::size_t substituteRecords() {
+    std::size_t records = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(ShaderDiskCache::EntryDirectory())) records += entry.path().extension() == ".slots";
+    return records;
+}
+
+void verifyBufferPresenceSubstitutes(const char* self) {
+    const auto recordsBefore = substituteRecords();
+    PresenceRequest bound(PresenceBound);
+    const auto boundResult = Recompile(bound.request);
+    PresenceRequest absent(PresenceNull);
+    const auto absentResult = Recompile(absent.request);
+    require(absentResult.specializationId == boundResult.specializationId && spirvWords(absentResult) == spirvWords(boundResult), "a null V# did not share the bound slot's specialized module");
+    ShaderDiskCache::Flush();
+    require(substituteRecords() == recordsBefore + 1u, "the bound slot's substitute was not persisted");
+    const auto words = spirvWords(boundResult);
+    std::vector<std::byte> bytes(words.size() * sizeof(std::uint32_t));
+    std::memcpy(bytes.data(), words.data(), bytes.size());
+    require(WriteFileAtomically(presenceReference(), bytes), "cannot write the presence reference SPIR-V");
+    const std::string command = "\"" + std::string(self) + "\" --load-presence-substitutes";
+    require(std::system(command.c_str()) == 0, "the process loading the persisted substitutes failed");
+}
+
+void verifyRawBufferShape() {
+    const auto replay = [](const std::array<std::uint32_t, 4>& descriptor) {
+        PresenceRequest request(descriptor);
+        request.presenceCode[0] = 0xe0700020u;
+        request.request.shader.code = request.presenceCode;
+        return Recompile(request.request);
+    };
+    const auto absent = replay(PresenceNull);
+    const auto bound = replay(PresenceBound);
+    const auto otherFormat = replay({0x10000000u, 0x00000000u, 0x40u, 0x00001204u});
+    require(absent.specializationId == bound.specializationId && spirvWords(absent) == spirvWords(bound), "a raw slot's first null V# did not share the bound slot's module");
+    require(otherFormat.specializationId == bound.specializationId && spirvWords(otherFormat) == spirvWords(bound), "a raw slot's format and selectors changed its module");
+    const auto rawMode = replay({0x10000000u, 0x00000000u, 0x40u, 0x30027facu});
+    require(rawMode.specializationId != bound.specializationId && spirvWords(rawMode) != spirvWords(bound), "a raw slot's out-of-range mode did not specialize its module");
+    std::cout << "raw buffer slots: a first null V#, other formats and selectors share one module; the out-of-range mode specializes it\n";
+}
+
+int runPresenceSubstituteProcess() {
+    PresenceRequest absent(PresenceNull);
+    const auto result = Recompile(absent.request);
+    const auto totals = ShaderDiskCache::Totals();
+    require(totals.hits == 1 && totals.misses == 0, "the presence program was not loaded from the disk cache");
+    std::vector<std::byte> reference;
+    require(ReadWholeFile(presenceReference(), reference), "cannot read the presence reference SPIR-V");
+    const auto words = spirvWords(result);
+    require(reference.size() == words.size() * sizeof(std::uint32_t) && std::memcmp(reference.data(), words.data(), reference.size()) == 0, "a null V# in a new process did not reproduce the module specialized with the persisted substitute");
+    std::cout << "a new process specialized the null V# with the persisted substitute (" << words.size() << " SPIR-V words)\n";
+    return 0;
 }
 
 void verifyBindingPlanSelection() {
@@ -1809,6 +2269,102 @@ void verifySpecializationLiveness() {
     require(SpecializeSpirv(specialized) == specialized, "dead computation removal is not stable");
 }
 
+void verifySpecializationFunctionLiveness() {
+    std::vector<std::uint32_t> words{spv::MagicNumber, 0x00010300u, 0u, 64u, 0u};
+    const auto emit = [&](spv::Op op, std::initializer_list<std::uint32_t> operands) {
+        words.push_back((static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op);
+        words.insert(words.end(), operands);
+    };
+    emit(spv::OpCapability, {spv::CapabilityShader});
+    emit(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+    emit(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, 10u, 0x6e69616du, 0u});
+    emit(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, 40u, 0x00787561u});
+    for (const auto entry : {10u, 40u}) emit(spv::OpExecutionMode, {entry, spv::ExecutionModeLocalSize, 1u, 1u, 1u});
+    emit(spv::OpName, {20u, 0x64616564u, 0u});
+    emit(spv::OpName, {22u, 0x64616f6cu, 0u});
+    emit(spv::OpDecorate, {22u, spv::DecorationRelaxedPrecision});
+    emit(spv::OpTypeVoid, {1u});
+    emit(spv::OpTypeBool, {2u});
+    emit(spv::OpTypeInt, {3u, 32u, 0u});
+    emit(spv::OpTypePointer, {4u, spv::StorageClassPrivate, 3u});
+    emit(spv::OpTypeFunction, {5u, 1u});
+    emit(spv::OpConstantFalse, {2u, 6u});
+    emit(spv::OpConstant, {3u, 7u, 0u});
+    emit(spv::OpVariable, {4u, 8u, spv::StorageClassPrivate, 7u});
+    emit(spv::OpFunction, {1u, 10u, spv::FunctionControlMaskNone, 5u});
+    emit(spv::OpLabel, {11u});
+    emit(spv::OpSelectionMerge, {14u, spv::SelectionControlMaskNone});
+    emit(spv::OpBranchConditional, {6u, 12u, 13u});
+    emit(spv::OpLabel, {12u});
+    emit(spv::OpFunctionCall, {1u, 15u, 20u});
+    emit(spv::OpBranch, {14u});
+    emit(spv::OpLabel, {13u});
+    emit(spv::OpFunctionCall, {1u, 16u, 30u});
+    emit(spv::OpBranch, {14u});
+    emit(spv::OpLabel, {14u});
+    emit(spv::OpReturn, {});
+    emit(spv::OpFunctionEnd, {});
+    emit(spv::OpFunction, {1u, 20u, spv::FunctionControlMaskNone, 5u});
+    emit(spv::OpLabel, {21u});
+    emit(spv::OpLoad, {3u, 22u, 8u});
+    emit(spv::OpStore, {8u, 22u});
+    emit(spv::OpFunctionCall, {1u, 23u, 50u});
+    emit(spv::OpReturn, {});
+    emit(spv::OpFunctionEnd, {});
+    emit(spv::OpFunction, {1u, 30u, spv::FunctionControlMaskNone, 5u});
+    emit(spv::OpLabel, {31u});
+    emit(spv::OpFunctionCall, {1u, 32u, 60u});
+    emit(spv::OpReturn, {});
+    emit(spv::OpFunctionEnd, {});
+    for (const auto function : {40u, 50u, 60u}) {
+        emit(spv::OpFunction, {1u, function, spv::FunctionControlMaskNone, 5u});
+        emit(spv::OpLabel, {function + 1u});
+        emit(spv::OpStore, {8u, 7u});
+        emit(spv::OpReturn, {});
+        emit(spv::OpFunctionEnd, {});
+    }
+    const auto functions = [](const std::vector<std::uint32_t>& module) {
+        std::vector<std::uint32_t> result;
+        for (std::size_t cursor = 5; cursor < module.size(); cursor += module[cursor] >> 16u) {
+            if ((module[cursor] & 0xffffu) == spv::OpFunction) result.push_back(module[cursor + 2u]);
+        }
+        return result;
+    };
+    const auto specialized = SpecializeSpirv(words);
+    require(functions(specialized) == std::vector<std::uint32_t>{10u, 30u, 40u, 60u}, "specialization retained an uncalled helper or removed a transitive call or entry point");
+    std::size_t calls = 0;
+    std::size_t stores = 0;
+    for (std::size_t cursor = 5; cursor < specialized.size(); cursor += specialized[cursor] >> 16u) {
+        const auto op = static_cast<spv::Op>(specialized[cursor] & 0xffffu);
+        if (op == spv::OpFunctionCall) {
+            require(specialized[cursor + 3u] == 30u || specialized[cursor + 3u] == 60u, "specialization retained a call to a removed function");
+            ++calls;
+        }
+        if (op == spv::OpStore) ++stores;
+        if (op == spv::OpName || op == spv::OpDecorate) require(specialized[cursor + 1u] != 20u && specialized[cursor + 1u] != 22u, "specialization retained metadata for a removed function or its results");
+    }
+    require(calls == 2u && stores == 2u, "specialization lost a reachable helper effect or retained a dead one");
+    require(SpecializeSpirv(specialized) == specialized, "function removal is not stable");
+    std::vector<std::uint32_t> library(words.begin(), words.begin() + 5);
+    for (std::size_t cursor = 5; cursor < words.size(); cursor += words[cursor] >> 16u) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op != spv::OpEntryPoint && op != spv::OpExecutionMode) library.insert(library.end(), words.begin() + cursor, words.begin() + cursor + count);
+    }
+    require(functions(SpecializeSpirv(library)) == functions(words), "specialization removed functions from a module without entry points");
+    auto decorated = words;
+    for (std::size_t cursor = 5; cursor < decorated.size(); cursor += decorated[cursor] >> 16u) {
+        if ((decorated[cursor] & 0xffffu) != spv::OpTypeVoid) continue;
+        const std::array<std::uint32_t, 8> group{
+            (2u << 16u) | spv::OpDecorationGroup, 63u,
+            (3u << 16u) | spv::OpDecorate, 63u, spv::DecorationRelaxedPrecision,
+            (3u << 16u) | spv::OpGroupDecorate, 63u, 22u};
+        decorated.insert(decorated.begin() + cursor, group.begin(), group.end());
+        break;
+    }
+    require(functions(SpecializeSpirv(decorated)) == functions(words), "specialization removed a helper referenced by unsupported grouped metadata");
+}
+
 constexpr std::uint64_t PlanSrtAddress = 0x7f0000010000ull;
 constexpr std::uint64_t PlanTableAddress = 0x7f0000020000ull;
 constexpr std::uint64_t PlanMaterialAddress = 0x7f0000030000ull;
@@ -1823,7 +2379,6 @@ struct PlanFixture {
     ShaderStage stage = ShaderStage::Compute;
     std::uint64_t codeAddress = 0;
     std::uint32_t waveSize = 64;
-    bool groupId = false;
     std::vector<std::uint32_t> code;
     std::vector<std::uint32_t> userData;
     std::vector<std::pair<std::uint64_t, std::vector<std::uint32_t>>> regions;
@@ -1840,7 +2395,7 @@ struct PlanFixture {
         request.context.waveSize = waveSize;
         request.context.userDataBaseRegister = 0;
         request.context.userData = userData;
-        if (stage == ShaderStage::Compute) request.context.compute = ShaderComputeStageInfo{{waveSize, 1u, 1u}, 0u, {groupId, false, false}, false, 1u};
+        if (stage == ShaderStage::Compute) request.context.compute = ShaderComputeStageInfo{{waveSize, 1u, 1u}, 0u, {false, false, false}, false, 1u};
         request.context.pixel = pixel;
         request.context.memory = memory;
         request.target.vulkanVersion = 0x00401000u;
@@ -1939,31 +2494,6 @@ std::vector<PlanFixture> planFixtures() {
     place(palette, 0x10u, imageWords(PlanTextureAddress));
     place(palette, 0x18u, imageWords(PlanTextureAddress + 0x100u));
     add("pointer image table", 64, {0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0x8f108210u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, palette}, {PlanMaterialAddress, {0u, 1u, 0u, 1u, 0u, 0u, 0u, 0u}}});
-
-    std::vector<std::uint32_t> nestedSrt(16u, 0u);
-    place(nestedSrt, 0u, bufferWords(PlanTableAddress, 16u, 4u));
-    place(nestedSrt, 4u, bufferWords(PlanMaterialAddress, 0u, 32u));
-    place(nestedSrt, 8u, bufferWords(PlanOutputAddress, 0u, 4096u));
-    std::vector<std::uint32_t> parents(16u, 0u);
-    place(parents, 2u, {static_cast<std::uint32_t>(PlanPointerAddress), static_cast<std::uint32_t>(PlanPointerAddress >> 32u)});
-    place(parents, 6u, {static_cast<std::uint32_t>(PlanPointerAddress + 256u), static_cast<std::uint32_t>(PlanPointerAddress >> 32u)});
-    std::vector<std::uint32_t> nestedBuffers(128u, 0u);
-    place(nestedBuffers, 40u, bufferWords(PlanPayloadAddress, 64u, 1u));
-    place(nestedBuffers, 104u, bufferWords(PlanPayloadAddress + 64u, 64u, 1u));
-    std::vector<std::uint32_t> nestedImages(32u, 0u);
-    place(nestedImages, 0u, imageWords(PlanTextureAddress));
-    place(nestedImages, 8u, imageWords(PlanTextureAddress + 256u));
-    place(nestedImages, 16u, imageWords(PlanTextureAddress + 256u));
-    place(nestedImages, 24u, imageWords(PlanTextureAddress + 512u));
-    std::vector<std::uint32_t> nestedCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xf4080800u, 0xfa000030u,
-    0x8f108302u, 0xf4200444u, 0x20000000u, 0xf4200504u, 0x20000004u, 0x8f128411u, 0x8f148514u,
-    0xf4240b02u, 0x24000008u, 0xf4080616u, 0xfa0000a0u, 0xf42c090cu, 0x28000000u,
-    0x360200bfu, 0x7e020d01u, 0x060202f0u, 0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u,
-    0x01090401u, 0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,};
-    nestedCode.insert(nestedCode.begin() + 13u, 0x87118311u);
-    nestedCode.insert(nestedCode.begin() + 15u, 0x87148114u);
-    add("nested pointer image table", 64u, std::move(nestedCode), srtPointer, {{PlanSrtAddress, nestedSrt}, {PlanTableAddress, parents}, {PlanPointerAddress, nestedBuffers}, {PlanPayloadAddress, nestedImages}, {PlanMaterialAddress, {0u, 0u, 0u, 1u, 1u, 0u, 1u, 1u}}});
-    fixtures.back().groupId = true;
 
     PlanFixture fragment;
     fragment.name = "fragment parameters";
@@ -2074,7 +2604,7 @@ IrResourcePlan handBuiltPlan() {
     DescriptorSource table;
     table.dwordCount = 8u;
     table.dwords[0] = &readConst(3);
-    table.tableColumn = TableColumn{2u, 32u, 16u, 4u, 8u, 0xffu, false, true, false, {KeyDomain{3u, 4u, 16u, false}, KeyDomain{2u, 8u, 4u, true}}, false};
+    table.tableColumn = TableColumn{2u, 32u, 16u, 4u, 8u, 0xffu, false, true, {KeyDomain{3u, 4u, 16u, false}, KeyDomain{2u, 8u, 4u, true}}, false};
     table.tableColumn->selected = true;
     table.tableColumn->selection = 2u;
     table.tableColumn->pointerHops = {PointerHop{0u, 0x10u}, PointerHop{8u, 0x20u}};
@@ -2162,7 +2692,7 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.descriptorSources.size(); ++index) {
         const auto& a = left.descriptorSources[index];
         const auto& b = right.descriptorSources[index];
-        if (a.dwordCount != b.dwordCount || a.tableColumn != b.tableColumn || a.requiredBlocks != b.requiredBlocks || (a.tableColumn.has_value() && (a.tableColumn->keyDomains != b.tableColumn->keyDomains || a.tableColumn->unkeyed != b.tableColumn->unkeyed || a.tableColumn->maxKey != b.tableColumn->maxKey))) return false;
+        if (a.dwordCount != b.dwordCount || a.tableColumn != b.tableColumn || (a.tableColumn.has_value() && (a.tableColumn->keyDomains != b.tableColumn->keyDomains || a.tableColumn->unkeyed != b.tableColumn->unkeyed || a.tableColumn->maxKey != b.tableColumn->maxKey))) return false;
         for (std::size_t dword = 0; dword < a.dwords.size(); ++dword) {
             if (!sameValue(a.dwords[dword], b.dwords[dword])) return false;
         }
@@ -2227,31 +2757,6 @@ void mutateWords(std::vector<std::uint32_t>& words, std::mt19937& random) {
     }
 }
 
-void verifyNestedResolutionReuse(const IrResourcePlan& plan, const ResourceSnapshot& snapshot) {
-    auto info = plan.info;
-    ResourceMaterializer::PrepareImageModes(info);
-    constexpr std::uint64_t MemoKey = 0x6e6573746564u;
-    const auto first = ResourceMaterializer::ResolveImageTablesShared(info, snapshot, MemoKey);
-    const auto same = ResourceMaterializer::ResolveImageTablesShared(info, snapshot, MemoKey);
-    if (std::getenv("APS5_NO_TABLE_RESOLUTION_REUSE") == nullptr) require(first == same, "nested table resolution: an unchanged snapshot was not shared");
-    auto changed = snapshot;
-    auto codes = changed.tables.nested.at(0).codes.Copy();
-    require(!codes.empty(), "nested table resolution: the child fixture is empty");
-    codes[0] = ImageTableAbi::PoisonCode(ImageTableAbi::OutsideDomainPoison);
-    changed.tables.nested[0].codes = SharedValues<std::uint32_t>(std::move(codes));
-    const auto child = ResourceMaterializer::ResolveImageTablesShared(info, changed, MemoKey);
-    const auto freshChild = ResourceMaterializer::ResolveImageTables(info, changed);
-    require(child->map == freshChild.map && child->map != first->map, "nested table resolution: changing only a child reused the old map");
-    changed = snapshot;
-    auto pointers = changed.tables.tables.at(0).pointers.Copy();
-    require(!pointers.empty(), "nested table resolution: the pointer fixture is empty");
-    pointers[0] += 0x120u;
-    changed.tables.tables[0].pointers = SharedValues<std::uint64_t>(std::move(pointers));
-    const auto pointer = ResourceMaterializer::ResolveImageTablesShared(info, changed, MemoKey);
-    const auto freshPointer = ResourceMaterializer::ResolveImageTables(info, changed);
-    require(pointer->map == freshPointer.map && pointer->map != first->map, "nested table resolution: changing only a pointer reused the old map");
-}
-
 std::size_t verifyRoundTripRuntimes(const IrResourcePlan& plan, const IrResourcePlan& decoded, const PlanFixture& fixture, std::uint32_t seed, const std::string& what) {
     std::mt19937 random(seed);
     std::size_t succeeded = 0;
@@ -2270,7 +2775,6 @@ std::size_t verifyRoundTripRuntimes(const IrResourcePlan& plan, const IrResource
         const auto original = materializePlan(plan, runtime);
         const auto loaded = materializePlan(decoded, runtime);
         require(sameMaterialization(original, loaded), what + ": runtime " + std::to_string(run) + " materialized differently from the decoded plan (" + original.error + " / " + loaded.error + ")");
-        if (run == 0u && original.ok && !original.snapshot.tables.nested.empty()) verifyNestedResolutionReuse(plan, original.snapshot);
         if (original.ok) ++succeeded;
     }
     return succeeded;
@@ -2352,9 +2856,6 @@ void verifyMalformedPlans() {
     rejects("a uniform fill of five words", [](IrResourcePlan& plan) { plan.uniformFill.fill.words = 5u; });
     rejects("an image table heap past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->heapSource = 4u; });
     rejects("an image table key past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->keyDomains[1].source = 4u; });
-    rejects("a buffer table with eight dwords", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->buffer = true; });
-    rejects("an image table cycle", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->heapSource = 1u; });
-    rejects("an image table parent that is not a buffer", [](IrResourcePlan& plan) { plan.descriptorSources[2].tableColumn = *plan.descriptorSources[1].tableColumn; });
     rejects("an image table selection past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->selection = 4u; });
     auto foreign = handBuiltPlan();
     IrValue stray(IrOpcode::Void, IrType::U32, 99u);
@@ -2409,12 +2910,6 @@ void verifyPlanRoundTrip() {
     require(phi.IsPhi() && phi.PhiBlockCount() == 2u && phi.PhiBlock(0)->Id() == 3u && phi.PhiBlock(1)->Id() == 7u && phi.Argument(1)->ImmediateU32() == 0u, "the decoded phi lost its blocks or operands");
     require(handDecoded.uniformFill.values[0] == handDecoded.uniformFill.values[1] && handDecoded.uniformFill.values[0] != nullptr && handDecoded.uniformFill.values[2] == nullptr, "the decoded uniform fill lost its shared or null values");
     require(samePlan(handBuilt, handDecoded), "the decoded hand-built plan differs from the plan in a field or a value");
-    auto bufferTable = handBuiltPlan();
-    bufferTable.descriptorSources[1].tableColumn->buffer = true;
-    bufferTable.descriptorSources[1].tableColumn->dwordCount = 4u;
-    const auto bufferBytes = encodedPlan(bufferTable);
-    IrResourcePlan bufferDecoded;
-    require(bufferBytes != handBytes && ShaderDiskCache::DecodePlan(bufferBytes, bufferDecoded) && samePlan(bufferTable, bufferDecoded), "the nested buffer column changed in a disk-cache round trip");
     PlanFixture handFixture;
     handFixture.userData = {static_cast<std::uint32_t>(PlanSrtAddress), static_cast<std::uint32_t>(PlanSrtAddress >> 32u), 0u, 0u};
     std::vector<std::uint32_t> handSrt(16, 0u);
@@ -2725,6 +3220,68 @@ void verifyPlanAcrossProcesses(const char* self) {
     run("--load-plan-switch");
 }
 
+void verifySpecializationDropsDeadConstants() {
+    const auto module = [](std::uint32_t selector) {
+        std::vector<std::uint32_t> words{spv::MagicNumber, 0x00010300u, 0u, 64u, 0u};
+        const auto emit = [&](spv::Op op, std::initializer_list<std::uint32_t> operands) {
+            words.push_back((static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op);
+            words.insert(words.end(), operands);
+        };
+        emit(spv::OpCapability, {spv::CapabilityShader});
+        emit(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+        emit(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, 10u, 0x6e69616du, 0u});
+        emit(spv::OpExecutionMode, {10u, spv::ExecutionModeLocalSize, 1u, 1u, 1u});
+        emit(spv::OpName, {6u, 0x00006c73u});
+        emit(spv::OpTypeVoid, {1u});
+        emit(spv::OpTypeBool, {2u});
+        emit(spv::OpTypeInt, {3u, 32u, 0u});
+        emit(spv::OpTypePointer, {4u, spv::StorageClassPrivate, 3u});
+        emit(spv::OpTypeFunction, {5u, 1u});
+        emit(spv::OpConstant, {3u, 6u, selector});
+        emit(spv::OpConstant, {3u, 7u, 4u});
+        emit(spv::OpConstant, {3u, 9u, 1u});
+        emit(spv::OpConstant, {3u, 21u, 3u});
+        emit(spv::OpTypeArray, {22u, 3u, 21u});
+        emit(spv::OpTypePointer, {23u, spv::StorageClassPrivate, 22u});
+        emit(spv::OpVariable, {4u, 8u, spv::StorageClassPrivate});
+        emit(spv::OpVariable, {23u, 24u, spv::StorageClassPrivate});
+        emit(spv::OpFunction, {1u, 10u, spv::FunctionControlMaskNone, 5u});
+        emit(spv::OpLabel, {11u});
+        emit(spv::OpIEqual, {2u, 12u, 6u, 6u});
+        emit(spv::OpSelect, {3u, 13u, 12u, 7u, 9u});
+        emit(spv::OpStore, {8u, 13u});
+        emit(spv::OpReturn, {});
+        emit(spv::OpFunctionEnd, {});
+        return words;
+    };
+    struct Contents {
+        std::map<std::uint32_t, std::uint32_t> constants;
+        std::size_t names = 0;
+        std::uint32_t stored = 0;
+    };
+    const auto contents = [](const std::vector<std::uint32_t>& words) {
+        Contents result;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+            require(count != 0u && count <= words.size() - cursor, "dead constant removal truncated an instruction");
+            if (op == spv::OpConstant && count == 4u) result.constants.emplace(words[cursor + 2u], words[cursor + 3u]);
+            if (op == spv::OpName && words[cursor + 1u] == 6u) ++result.names;
+            if (op == spv::OpStore && words[cursor + 1u] == 8u) result.stored = words[cursor + 2u];
+            cursor += count;
+        }
+        return result;
+    };
+    const auto rgba = SpecializeSpirv(module(4u));
+    const auto bgra = SpecializeSpirv(module(6u));
+    require(rgba == bgra, "variants that differ only in a folded constant specialized to different SPIR-V");
+    const auto result = contents(rgba);
+    require(!result.constants.contains(6u) && result.names == 0u, "specialization kept a constant the folding consumed, or its name");
+    require(result.constants.contains(21u), "specialization removed the constant an array type's length still uses");
+    require(result.constants.contains(result.stored) && result.constants.at(result.stored) == 4u, "the store no longer reads the selected value");
+    require(SpecializeSpirv(rgba) == rgba, "dead constant removal is not stable");
+}
+
 void verifyDefaultDirectory(const char* self) {
     setEnvironment("ANYPS5_SHADER_CACHE_DIR", "");
     setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
@@ -2746,13 +3303,6 @@ int main(int argc, char** argv) {
             ShaderDiskCache::Shutdown();
             require(ShaderDiskCache::Writers() == 0, "the housekeeping writer did not stop");
             std::cout << "housekeeping version " << directory.filename().string() << '\n';
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--prebuilt-pack-ownership") {
-            const auto directory = std::filesystem::temp_directory_path() / ("aps5-pack-ownership-" + std::to_string(std::random_device{}()));
-            std::filesystem::create_directories(directory);
-            verifyPrebuiltPackOwnership(directory);
-            std::filesystem::remove_all(directory);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resource-plan-codec") {
@@ -2784,8 +3334,14 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--large-file") return runLargeFileWrite();
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-lazy-plan") return runLazyPlanLoadingProcess(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--load-eager-plan") return runLazyPlanLoadingProcess(true);
+        if (argc == 2 && std::string_view(argv[1]) == "--load-wrap-loop") { verifyUnnormalizedWrapTransitions(true); return 0; }
+        if (argc == 2 && (std::string_view(argv[1]) == "--load-direct-image-refusal" || std::string_view(argv[1]) == "--load-direct-image-loop-guard"
+                || std::string_view(argv[1]) == "--load-guarded-direct-image")) return runDirectImageLoadingProcess(argv[1]);
         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-presence-substitutes") return runPresenceSubstituteProcess();
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
@@ -2798,7 +3354,6 @@ int main(int argc, char** argv) {
         verifyEntryRoundTrip();
         verifyPrebuiltPack(directory / "packs");
         verifyArtifactStorageIsolation();
-        verifyHashBytes();
         verifyKeySensitivity();
         verifyMeshBarycentricRequestSerialization();
         verifyFloatModeSerialization();
@@ -2810,14 +3365,25 @@ int main(int argc, char** argv) {
         verifyAcrossProcesses(argv[0]);
         verifyPrebuiltAcrossProcesses(argv[0], directory);
         verifyPlanAcrossProcesses(argv[0]);
+        verifyUnnormalizedWrapTransitions();
+        {
+            DirectImageCacheLoopGuard loop("8");
+            const std::string command = "\"" + std::string(argv[0]) + "\" --load-wrap-loop";
+            require(std::system(command.c_str()) == 0, "cold wrap loop artifact process failed");
+        }
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();
+        verifyResultMemoBudget();
         verifyBufferAlignmentSpecialization();
+        verifyBufferPresenceSubstitutes(argv[0]);
+        verifyRawBufferShape();
         verifyBindingPlanSelection();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
         verifySpecializationLiveness();
+        verifySpecializationFunctionLiveness();
+        verifySpecializationDropsDeadConstants();
         ShaderRecompiler::ShaderDiskCache::Flush();
         removeCacheDirectory(directory);
         std::cout << "shader disk cache tests passed\n";

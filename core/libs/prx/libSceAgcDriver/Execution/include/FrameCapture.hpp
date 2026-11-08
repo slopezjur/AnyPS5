@@ -10,7 +10,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -31,6 +30,12 @@ enum class FrameCallKind : std::uint32_t {
     End,
     DisplayBuffer,
     UnregisterVideoOutput,
+    QueueStates,
+    AliasedPages,
+    Checkpoint,
+    // The bindless tables the texture service had registered when the capture started
+    // (values: BindlessRegistrations words), for agc_frame_replay's heap primer.
+    BindlessTables,
 };
 
 struct FrameCall {
@@ -50,7 +55,7 @@ struct FrameCall {
     std::vector<ShaderRegister> primitive;
 };
 
-enum class FrameMemoryKind : std::uint32_t { Range = 1, Snapshot, Delta, Reference };
+enum class FrameMemoryKind : std::uint32_t { Range = 1, Snapshot, Delta, Reference, Checkpoint };
 
 enum class FrameRangeKind : std::uint32_t { Watched = 1, Unwatched, Section, Alias, File, Host };
 
@@ -92,6 +97,7 @@ public:
     std::uint64_t WriteSnapshot(std::uint64_t address, std::span<const std::byte> bytes);
     void WriteDelta(std::uint64_t group, std::uint64_t completed, std::uint64_t address, std::span<const std::byte> bytes);
     void WriteReference(std::uint64_t index, std::uint64_t address, std::span<const std::byte> pixels);
+    void WriteCheckpoint(std::uint64_t frame, std::uint64_t address, std::span<const std::byte> bytes);
     void Finish(std::string_view header);
 
     std::uint64_t RawBytes() const;
@@ -133,8 +139,6 @@ private:
 
 std::string_view FrameCallName(FrameCallKind kind);
 bool AllZero(std::span<const std::byte> bytes);
-using GuestRead = void (*)(std::uint64_t address, std::span<std::byte> destination);
-std::uint64_t ReadAroundRanges(std::uint64_t address, std::span<std::byte> bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, GuestRead read);
 
 }
 

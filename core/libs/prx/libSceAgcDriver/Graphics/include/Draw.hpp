@@ -4,26 +4,28 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
-#include <array>
-#include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace AgcDriver::Graphics {
 
-struct VkDrawCounts {
-    std::uint64_t direct = 0;
-    std::uint64_t indexed = 0;
-    std::uint64_t indirect = 0;
-    std::uint64_t mesh = 0;
-};
-VkDrawCounts TakeVkDrawCounts();
-
 struct HostImport;
 
+// #6188 (draw-ahead): the draw state a draw-ahead worker prepares for an entry it compiled ahead.
+struct AheadDraw {
+    std::shared_ptr<const VertexInputLayout> vertexInput;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    std::vector<std::uint32_t> contentKey;
+    VkDevice device = VK_NULL_HANDLE;
+};
+std::uint64_t AheadDrawUses();
+const AheadDraw* AheadDrawFor(const AheadDraw* ahead, const Context& context);
+std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const State& state, std::span<const CompiledShader> shaders);
 struct DrawTraceContext {
     std::uint64_t token = 0;
     std::uint64_t submission = 0;
@@ -35,7 +37,16 @@ struct DrawTraceContext {
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
+// S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): what a draw's resource build can do before the draw without
+// the device lock, made from the draw's own inputs by the draw pipeline's preparer: the resource
+// key, whether the resource cache held an entry for it then, and stage A of a fresh build (see
+// ShaderResources' DeferredDrawBuild). Draw uses it only when its own lookup misses and the
+// stamps taken before the preparation (ForgetSerial, the registry generation, the device) are
+// unchanged; otherwise it builds under the lock as before.
+struct PreparedDraw;
+bool SplitDrawBuild();
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {});
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr, const DrawTraceContext* trace = nullptr);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;
@@ -47,12 +58,6 @@ void PreparePixelFunctionLds(const Context& context, VkCommandBuffer commands, s
 void BindPixelFunctionLds(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout);
 void CheckPixelFunctionLds(const Context& context);
 void ReleasePixelFunctionLds(VkDevice device);
-bool UsesMeshWindow(std::span<const CompiledShader> shaders);
-bool ValidationKey(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key);
-VkDescriptorSetLayout MeshWindowSetLayout(const Context& context);
-void PrepareMeshWindow(const Context& context);
-void BindMeshWindow(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout);
-void ReleaseMeshWindow(VkDevice device);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
@@ -62,6 +67,10 @@ struct DrawInputCopy {
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    std::vector<std::uint64_t> ownedWords;
+    std::uint64_t ownedSince = 0;
+    std::uint64_t ownedForget = 0;
+    bool ownedArm = false;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
@@ -93,13 +102,6 @@ struct MeshArgumentRules {
     std::uint32_t maxTotal;
 };
 MeshArgumentRules MeshArgumentRulesFor(const Context& context, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t indexCount);
-struct MeshGrid {
-    std::uint32_t groups;
-    std::uint32_t instances;
-    std::uint32_t layers;
-    std::uint32_t layerStride;
-};
-std::optional<MeshGrid> MeshGridFor(const Context& context, std::uint32_t groups, std::uint32_t instances);
 MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshArgumentRules& rules);
 
 // Why DrawWithRecipe did not record from the recipe (the caller then runs Draw): the draw is not
@@ -126,6 +128,9 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// APS5_PROFILE_DRAW: prints the [draws] window so far as `window` and starts the next one
+// (ProfileWindows::Close; nothing when the profile is off).
+void CloseDrawProfileWindow(const char* window);
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,
@@ -147,7 +152,6 @@ struct DrawPassCounts {
     std::uint64_t storeFlushes = 0;
 };
 std::array<DrawPassCounts, 2> DrawPassTotals();
-std::array<std::uint64_t, PassBreakCount> DrawPassBreaks();
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
@@ -175,14 +179,6 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
 bool CommitTrims();
-enum class AddressDrawReuse : std::uint8_t { Reused, Built, NotReadOnly, NotSpaceOnly, SnapshotOutside, PartialOverlap, SnapshotChanged, MovedBuffer, PatchedData, SpaceChanged, InUse, Revalidation, Count };
-using AddressDrawReuseCounts = std::array<std::uint64_t, static_cast<std::size_t>(AddressDrawReuse::Count)>;
-AddressDrawReuseCounts AddressDrawReuseCounters();
-const char* AddressDrawReuseName(AddressDrawReuse outcome);
-std::uint64_t AddressDrawReuseVerifications();
-enum class DrawStopForTest { None = 0, ReturnAfterResolve = 1, ThrowAfterResolve = 2 };
-void SetSpaceKeepFailuresForTest(std::uint32_t count);
-void SetDrawStopAfterResolveForTest(DrawStopForTest stop);
 
 }
 

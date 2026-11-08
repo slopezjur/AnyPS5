@@ -206,16 +206,11 @@ public:
         tracking = nullptr;
     }
 
-    std::shared_ptr<ImportState> TryImport(std::uint64_t address, std::size_t bytes) {
+    std::shared_ptr<ImportState> Import(std::uint64_t address, std::size_t bytes) {
         std::lock_guard gpu(GpuMutex());
         const auto* imported = HostImportFor(context, address, bytes);
-        return imported != nullptr ? calls.Add(*imported) : nullptr;
-    }
-
-    std::shared_ptr<ImportState> Import(std::uint64_t address, std::size_t bytes) {
-        auto imported = TryImport(address, bytes);
         Require(imported != nullptr, "host pointer import was refused for the lifetime test");
-        return imported;
+        return calls.Add(*imported);
     }
 
     void Cleanup() {
@@ -706,7 +701,6 @@ struct MutationRace {
     Allocation* allocation;
     std::shared_ptr<ImportState> replacement;
     unsigned calls = 0;
-    bool refused = false;
 };
 
 MutationRace* mutationRace = nullptr;
@@ -716,10 +710,7 @@ bool raceWaiter(std::uintptr_t address, std::size_t bytes) {
     Require(address == race.allocation->Address() && bytes == race.allocation->bytes, "pin waiter received the wrong mutation extent");
     std::lock_guard gpu(GpuMutex());
     race.fixture->Cleanup();
-    if (++race.calls == 1) {
-        race.replacement = race.fixture->TryImport(address, bytes);
-        race.refused = race.replacement == nullptr;
-    }
+    if (++race.calls == 1) race.replacement = race.fixture->Import(address, bytes);
     return true;
 }
 
@@ -758,7 +749,7 @@ void waiterFailure(Fixture& fixture) {
     Require(!imported->freed.load(), "a failed pin waiter retired an import");
 }
 
-void reimportRefusedWhileWaiting(Fixture& fixture) {
+void reimportBeforeRelock(Fixture& fixture) {
     Allocation allocation(fixture);
     const auto imported = fixture.Import(allocation.Address(), allocation.bytes);
     MutationRace race{&fixture, &allocation};
@@ -767,8 +758,9 @@ void reimportRefusedWhileWaiting(Fixture& fixture) {
     {
         GuestAllocations::Mutation mutation;
         mutation.Unmap(allocation.data, allocation.bytes, [&](const void*, std::size_t, const void*, bool) {
-            Require(race.refused && race.calls == 1 && race.replacement == nullptr, "an import of an extent a guest mutation waits on was not refused");
+            Require(race.calls == 2 && race.replacement != nullptr, "guest mutation did not recheck an import acquired before registry relock");
             requireFreed(imported);
+            requireFreed(race.replacement);
             allocation.Release();
         });
         allocation.registered = false;
@@ -809,7 +801,7 @@ int RunHostImportMutationRaceTests(const Context& context) {
     }
     Fixture fixture(context);
     waiterFailure(fixture);
-    reimportRefusedWhileWaiting(fixture);
+    reimportBeforeRelock(fixture);
     std::puts("host import mutation race tests passed");
     return 0;
 }

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -42,7 +43,12 @@ std::size_t Driver::dispatchCacheEntries() {
         if (stampValidate()) return std::size_t{4096};
         return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
     }();
-    return entries;
+    static const std::size_t large = [] {
+        const char* text = std::getenv("APS5_DISPATCH_CACHE_LARGE_ENTRIES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{65536};
+    }();
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchCacheLarge) ? std::max(entries, large) : entries;
 }
 
 std::uint64_t Driver::DispatchCacheBytes() {
@@ -51,7 +57,22 @@ std::uint64_t Driver::DispatchCacheBytes() {
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
         return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{256} << 20u;
     }();
-    return bytes;
+    static const std::uint64_t large = [] {
+        const char* text = std::getenv("APS5_DISPATCH_CACHE_LARGE_BYTES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{2048} << 20u;
+    }();
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchCacheLarge) ? std::max(bytes, large) : bytes;
+}
+
+void Driver::noteDispatchEvicted(std::uint64_t key) {
+    constexpr std::size_t ghostKeys = 1u << 18u;
+    if (!dispatchGhostKeys.insert(key).second) return;
+    dispatchGhostOrder.push_back(key);
+    if (dispatchGhostOrder.size() > ghostKeys) {
+        dispatchGhostKeys.erase(dispatchGhostOrder.front());
+        dispatchGhostOrder.pop_front();
+    }
 }
 
 EntryCounters Driver::DispatchCacheCounters() {
@@ -65,8 +86,7 @@ Driver::DispatchCacheFootprint Driver::DispatchCacheSize() {
 }
 
 std::uint64_t Driver::variantBytes(const DispatchVariant& variant) {
-    const auto held = [](const auto& values) { return static_cast<std::uint64_t>(values.capacity() * sizeof(values[0])); };
-    return sizeof(DispatchVariant) + held(variant.runs) + held(variant.words) + held(variant.shared) + held(variant.dataPositions) + held(variant.dataSlots) + held(variant.runBases) + held(variant.shaderDataPatches) + held(variant.captured) + held(variant.spans) + (variant.registeredViews != nullptr ? held(*variant.registeredViews) : 0u) + (variant.vertexInfo != nullptr ? sizeof(ShaderRecompiler::ShaderVertexStageInfo) : 0) + (variant.memory != nullptr ? variant.memory->Bytes() : 0);
+    return sizeof(DispatchVariant) + variant.words.size() * sizeof(std::uint32_t) + variant.shared.size() * sizeof(SharedWords) + variant.runs.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>) + variant.captured.size() * sizeof(ShaderRecompiler::MemoryRegion) + (variant.vertexInfo != nullptr ? sizeof(ShaderRecompiler::ShaderVertexStageInfo) : 0);
 }
 
 void Driver::accountVariant(const DispatchVariant& variant, bool added) {
@@ -80,6 +100,7 @@ void Driver::accountVariant(const DispatchVariant& variant, bool added) {
 }
 
 void Driver::eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it) {
+    noteDispatchEvicted(it->first);
     for (const auto& variant : it->second->variants) accountVariant(*variant, false);
     dispatchOrder.erase(it->second->order);
     dispatchCache.erase(it);

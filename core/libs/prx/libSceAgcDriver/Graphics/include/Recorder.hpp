@@ -1,11 +1,11 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/PendingWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
-#include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -19,17 +19,40 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
-#include <string>
 #include <vector>
 
 namespace AgcDriver::Graphics {
 
 class Buffer;
-class DeviceBuffer;
+
+struct PassLibraryState {
+    VkCullModeFlags cullMode;
+    VkFrontFace frontFace;
+    std::array<float, 3> depthBias;
+    std::array<float, 2> depthBounds;
+    VkBool32 depthTest;
+    VkBool32 depthWrite;
+    VkCompareOp depthCompare;
+    VkBool32 boundsTest;
+    VkBool32 stencilTest;
+    VkStencilOpState stencilFront;
+    VkStencilOpState stencilBack;
+};
+
+struct PassBinding {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    std::array<float, 3> depthBias{};
+    std::array<float, 2> depthBounds{};
+    bool hasLibrary = false;
+    PassLibraryState library{};
+};
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -61,36 +84,187 @@ public:
     // so a dispatch, fill or copy whose leading barrier asks for a subset of them may skip it
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
-    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr, std::source_location where = std::source_location::current());
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // Dispatch overlap (APS5_NO_DISPATCH_OVERLAP=1 off). A guest compute ring may run two of its
+    // dispatches at once unless the title orders them (a CS partial flush, a cache action, a release
+    // event, a wait, or any other packet between them); the packet loop says so per dispatch
+    // (SetDispatchOrder, thread-local, read once by the next recorded dispatch of the thread). A
+    // dispatch that may overlap the next one leaves its trailing barrier deferred
+    // (DeferDispatchBarrier, keyed by its guest queue); the next dispatch of the same queue that the
+    // title left unordered records into the same batch without a leading barrier (OverlapCommands),
+    // and every other path that records a command (Commands, StartDrawPass, the label and key store
+    // runs, sample dumps, Submit) records the deferred barrier first, so nothing else ever sees the
+    // dispatches' writes unordered. The leading barrier of the first dispatch of such a run orders
+    // everything recorded before the run, for all of them.
+    // Async compute lane (APS5_ASYNC_LANE=<ring>, hex, e.g. 51; off by default). The work a guest
+    // compute ring records goes to a second open batch (lane 1) submitted to its own VkQueue with
+    // its own timeline, so queue 0's later batches and the CPU waits for them do not queue behind
+    // it on the GPU. One global serial per batch; each batch knows its lane. GPU order between the
+    // lanes: a lane-1 batch waits for everything lane 0 submitted before it opened (the main open
+    // batch is submitted first), and a lane consuming a label the other lane stored (a WAIT_REG_MEM
+    // answered from the label table, NoteConsumedLabel) waits for that batch. Everything else the two
+    // lanes do is unordered, as two rings are on the hardware unless the title synchronizes them.
+    // Scans of pending work (writes, reads, labels) cover both lanes; prefix waits (Sync,
+    // WaitSerial, FinishUpTo) wait for both lanes up to the serial; the flush hook's targeted waits
+    // (SyncThrough) and Reap progress per lane. Keep() holds an object for both lanes' batches.
+    static std::uint32_t AsyncLaneRing();
+    static bool PendingCommandsTracked();
+    static bool LaneOwnFamily();
+    static void FilterLaneBarrier(VkPipelineStageFlags& sourceStage, VkPipelineStageFlags& destinationStage, VkAccessFlags& sourceAccess, VkAccessFlags& destinationAccess);
+    static bool CommandBufferPending(VkCommandBuffer commands, std::uint64_t generation, int* lane);
+    static std::uint64_t CommandBufferGeneration(VkCommandBuffer commands);
+    static int LaneOfQueue(std::uint32_t queue);
+    struct LaneScope {
+        int previous;
+        explicit LaneScope(int lane);
+        ~LaneScope();
+        LaneScope(const LaneScope&) = delete;
+        LaneScope& operator=(const LaneScope&) = delete;
+    };
+    // A WAIT_REG_MEM of the calling thread answered from the label table: the thread's lane's next
+    // GPU work waits for the other lane's batches that stored those dwords (applied at the next
+    // batch open or command, under the mutex).
+    static void NoteConsumedLabel(std::uint64_t address, std::size_t bytes);
+    // Records the calling thread's work into `lane` until destroyed, with the GPU edges a switch
+    // needs: the lane left is submitted and the lane entered waits for it, and back at the end
+    // (a dispatch of the async ring that touches images goes to the main lane this way).
+    struct LaneSwitch {
+        Recorder* recorder;
+        int from;
+        int to;
+        LaneSwitch(Recorder* recorder, int lane);
+        ~LaneSwitch() noexcept(false);
+        LaneSwitch(const LaneSwitch&) = delete;
+        LaneSwitch& operator=(const LaneSwitch&) = delete;
+    };
+    // The calling thread's lane as LaneScope set it (0 unless the async lane runs it).
+    static int ThreadLane();
+    bool AsyncLaneActive() const { return asyncTimeline != VK_NULL_HANDLE; }
+    // Submits the open batches of both lanes (a deadline flush, a drain).
+    void SubmitAllLanes();
     static bool DispatchOverlapEnabled();
     static void SetDispatchOrder(std::uint32_t queueKey, bool unordered);
+    // The order the packet loop set for this thread's next dispatch, cleared: the queue key (0 =
+    // none) and whether the title left it unordered after the queue's previous dispatch.
     static std::uint32_t TakeDispatchOrder(bool& unordered);
-    static constexpr std::uint64_t RunAccessWritten = 1, RunAccessImage = 2;
-    using RunAccess = std::array<std::uint64_t, 3>;
+    // The order set for this thread's next dispatch without taking it: its queue key when the title
+    // left it unordered, else 0 (a build's copy-ins recorded before that dispatch, see RunCommands).
     static std::uint32_t PeekUnorderedDispatch();
-    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkAccessFlags* coveredAccess, bool& overlapped);
-    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses);
-    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, bool& inRun, VkAccessFlags* coveredAccess);
-    void OpenBatch() { ensureOpen(); }
-    bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
-    void AfterRun(std::function<void(Recorder&)> work);
-    bool CloseRunOwing(const void* owner);
+    // `owner`: the dispatch's resources object; a run never takes the same one twice (a template's
+    // data refresh would overwrite words an earlier dispatch of the run may still read).
+    // `accesses`: the dispatch's guest ranges as GuestBufferMemory::RunAccesses gives them (see
+    // RunAtomicConflict).
+    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses = {});
+    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners);
     struct OverlapStatistics {
-        std::uint64_t deferred, overlapped, flushed;
+        std::uint64_t deferred, overlapped;
     };
     static OverlapStatistics OverlapCounts();
+    // The copy-ins of an unordered dispatch joining an open run of its ring (GuestBufferMemory::
+    // recordGpuCopies): the command buffer without recording the deferred barrier when a run of
+    // `queueKey` is open and `owner` (the build's guest memory, whose shadows the copies fill) takes
+    // no part in it yet; `inRun` then says the copies need no leading barrier (the run's first
+    // dispatch ordered everything before the run for transfers too). Else Commands(coveredAccess).
+    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess = nullptr, std::span<const std::array<std::uint64_t, 3>> accesses = {});
+    // Atomics in a staged shadow (APS5_NO_RUN_ATOMIC_GUARD=1 off; an APS5_AB switch). The dispatches of
+    // a run may update the same guest dwords atomically, which the hardware keeps coherent; a region
+    // copied into a shadow for one of them is not: its copy-in reads the memory before the run's
+    // other dispatches ran (a prelude copy-in even before the first), and its copy-back stores its
+    // own count over theirs. So a dispatch does not join the open run when one of its ranges overlaps
+    // a copied region with atomics of a dispatch of the run, or a copied region with atomics of its
+    // own overlaps any range of one (the run is closed first, as for an owner it holds already).
+    // Reads across a shadow (APS5_NO_RUN_STAGED_READ_GUARD=1 off; an APS5_AB switch). On the hardware a
+    // dispatch reading what an earlier unordered one writes mostly sees its results: the earlier one
+    // starts first. A shadow hides them for the whole run: a copied region of the joining dispatch is
+    // filled before the run (or before the run's first dispatch, a prelude), and a dispatch of the run
+    // that writes a copied region stores into memory only at the run's end. So a dispatch does not
+    // join when a range it reads (in place or copied) overlaps a range a dispatch of the run writes and
+    // either side of the overlap is a copied region (the run is closed first). Writes over writes stay
+    // (the copy-backs store only the dwords that changed), as do accesses both in place.
+    bool RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
+    bool RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> accesses) const;
+    static std::array<std::uint64_t, 2> RangeCheckCounts();
+    // Opens a batch when none is open, recording nothing (no deferred dispatch barrier either).
+    void OpenBatch() { ensureOpen(); }
+    // Work an overlapping dispatch owes after itself (its staged copy-backs): recorded right after
+    // the deferred barrier, wherever that is recorded. Only while a run is open.
+    void AfterRun(std::function<void(Recorder&)> work);
+    bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
+    // Batched staging (APS5_NO_BATCHED_STAGING=1 turns it off; an APS5_AB switch). NVIDIA drains the
+    // GPU at every transfer and barrier recorded between two dispatches, so the staged copy-ins of
+    // the dispatches that join a run go to a prelude command buffer submitted ahead of the run
+    // (one barrier before it, one after), and the run's copy-backs share one trailing barrier.
+    static bool BatchedStagingEnabled();
+    // At a run's first dispatch (VulkanDevice::recordDispatch: overlap capable, not joining a run,
+    // with staged copies of its own): ends the batch's command buffer and continues in a new one,
+    // the run's prelude (PreludeCommands) going between the two. Returns the command buffer to
+    // record into (the old one when the batch cannot split: a sample query is active).
+    VkCommandBuffer SplitForRun();
+    // The copy-ins of a dispatch joining the open run (RunCommands said inRun): the run's prelude,
+    // begun with the barrier that orders it after everything before the run; VK_NULL_HANDLE when
+    // the run has none (its first dispatch did not split), and the copies go inline.
+    VkCommandBuffer PreludeCommands();
+    // A pristine copy (APS5_STAGING_DIFF) of a shadow the prelude fills: recorded at the prelude's
+    // end, after one transfer barrier for all of them.
+    void PreludePristine(VkBuffer shadow, VkBuffer pristine, VkDeviceSize bytes);
+    // The copy-backs a run's deferred barrier records after itself (AfterRun work) while batched
+    // staging is on: they record no barriers of their own, and the run records one after all of
+    // them. AfterRunWrite notes a guest range one writes and returns true when an earlier one of
+    // the run wrote an overlapping range: the caller then records a barrier first (it orders every
+    // earlier copy-back, so the noted ranges restart).
+    bool AfterRunMerging() const { return open != nullptr && open->afterRunMerging; }
+    bool AfterRunWrite(std::uint64_t begin, std::uint64_t end);
+    // APS5_PROFILE_DRAW: batched staging and lost-overlap counts, cumulative.
+    struct BatchedStagingStats {
+        std::uint64_t splits, preludes, preludeCopies, pristineCopies, mergedCopyBacks, copyBackConflicts;
+        std::uint64_t lostNoRun, lostOtherQueue, lostRenderPass, lostStoreRun, lostOwner;
+    };
+    static BatchedStagingStats BatchedStagingCounts();
+    // APS5_PROFILE_DRAW: the call sites that closed open runs, cumulative, most frequent first: one
+    // text per site (file:line, flush path, run ring, closing thread's ring) and its count.
+    // `ring`: only runs of that guest queue (~0u: all).
+    static std::vector<std::pair<std::string, std::uint64_t>> RunCloseSites(std::size_t limit, std::uint32_t ring = ~0u);
+    // APS5_PROFILE_DRAW: unordered dispatches by guest queue: overlapped, and not (no open run, other).
+    static std::string OverlapByRing();
+    // Staged dispatches in runs (APS5_NO_STAGED_OVERLAP=1 off; an APS5_AB switch): a dispatch with
+    // buffers copied out of their imports joins and opens runs like any other.
+    static bool StagedOverlapEnabled();
+    // APS5_PROFILE_DRAW: the guest ranges the dispatches of the open run access, {begin, end, flags}
+    // with RunAccessWritten / RunAccessCopied / RunAccessAtomic (NoteRunAccess, after each
+    // DeferDispatchBarrier), and those of a dispatch joining the run checked against them
+    // (CheckRunConflicts); RunConflictReport is the cumulative tally.
+    static constexpr std::uint64_t RunAccessWritten = 1, RunAccessCopied = 2, RunAccessAtomic = 4, RunAccessImage = 8;
+    void NoteRunAccess(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses);
+    void CheckRunConflicts(std::uint64_t program, std::span<const std::array<std::uint64_t, 3>> accesses) const;
+    static std::string RunConflictReport();
+    // APS5_PROFILE_DRAW: a reused build whose previous use still owes its copy-backs (staged regions
+    // not copied back yet): where the run holding them is (this lane, the other lane, none).
+    void NoteOwedCopyBack(const void* owner);
+    static std::string OwedCopyBackReport();
+    // A build reused while an open run still owes the copy-backs of its previous use (staged regions
+    // of `owner`, the build's guest memory, see AfterRun): that run is closed first, so its
+    // copy-backs are recorded from the shadows before the reuse's copy-ins refill them, and the
+    // reuse records its own after its work. A run of the other lane is submitted, and this lane's
+    // open batch waits for it on the GPU. APS5_NO_OWED_RUN_CLOSE=1 (an APS5_AB switch) leaves the
+    // run open as before: the previous use's copy-backs then copy the refilled shadows and the
+    // reuse's own are skipped. Returns whether a run was closed.
+    bool CloseRunOwing(const void* owner, std::source_location where = std::source_location::current());
+    // APS5_PROFILE_DRAW: deferred barriers recorded, by the path that recorded them (Commands, a draw
+    // pass, key stores, a label store, the store run, sample dumps, Submit), cumulative.
+    static constexpr std::size_t DeferredFlushSites = 7;
+    static std::array<std::uint64_t, DeferredFlushSites> DeferredFlushCounts();
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
         bool barrier = true;
-        PassBreak reason = PassBreak::Continued;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    PassBinding& PassBound();
     void SealPassWriteOnly();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -104,26 +278,59 @@ public:
     bool QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's range.
     bool AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
-    void FlushKeyStores();
+    void FlushKeyStores(std::source_location where = std::source_location::current());
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
-    bool Idle() const { return open == nullptr && inFlight.empty(); }
+    bool Idle() const { return lanes[0] == nullptr && lanes[1] == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
-    std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
+    // The newest serial S such that every batch that may hold work recorded while OpenSerial() was
+    // <= S has completed (a resource retired at OpenSerial() is free to reuse once it is <= this).
+    // One lane: the oldest in-flight batch's serial - 1. With the async lane both lanes' open
+    // batches report the same OpenSerial() and the one submitted later gets a higher serial, so
+    // every open or in-flight batch also caps it at the serial it was opened at - 1.
+    // APS5_NO_LANE_OPEN_SERIAL=1 (an APS5_AB switch) leaves the open batches and the opening serials
+    // out as before: a slot retired in one lane's open batch could then be reused once the other
+    // lane's earlier-opened batch completed, while the first one still read it.
+    // RetiredSerial() (a use noted at UseSerial()) is capped the same way when a batch finishes.
+    std::uint64_t CompletedThrough() const;
+    static constexpr std::size_t MaxStreams = 16;
+    using Token = std::array<std::uint64_t, MaxStreams>;
+    static constexpr std::size_t LaneStreams = 2;
+    Token CallerToken() const;
+    Token AllToken() const;
+    static std::uint64_t TokenThrough(const Token& token);
+    bool TokenReached(const Token& token) const;
+    void FinishToken(const Token& token);
+    class CommandInHand {
+    public:
+        CommandInHand();
+        ~CommandInHand();
+        CommandInHand(const CommandInHand&) = delete;
+        CommandInHand& operator=(const CommandInHand&) = delete;
+    };
+    static bool CommandBufferInHand();
+    // Under the mutex, async lane only: the calling thread's lane's open (or next) batch waits on the
+    // GPU for everything lane `from` recorded so far (its open batch is submitted first).
+    void OrderAfterLane(int from);
+    // APS5_PROFILE_DRAW: the [lane-order] line (CompletedThrough answers lowered by the opening
+    // serials, cached-template data edges between the lanes).
+    static std::string LaneOrderReport();
+    static void CountTemplateEdge(bool beforeRefresh);
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
-    enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
-    std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
-    static constexpr VkPipelineStageFlags UploadScratchReuseStages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
+    // Waits for the oldest submitted batch (submitting the open one first when none is in flight)
+    // and runs its completion, releasing what it kept; false when there is nothing to wait for or
+    // the GPU mutex is not held by this thread.
+    bool RetireOldest();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
-    enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32, Index16Restart, Index32Restart, PaddedVertex };
+    enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32, Index16Restart, Index32Restart };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t UnwrittenSnapshotEntries = 4096;
@@ -134,6 +341,32 @@ public:
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
     static constexpr std::size_t ContainingSnapshotProbes = 16;
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // Owned draw snapshots (APS5_NO_OWNED_DRAW_SNAPSHOTS=1 off; an APS5_AB switch). A read-only draw
+    // input outside the write watch (CollectWrites 0: host imports compared, not watched) had no
+    // proof that it was unchanged, so every draw copied it whole into a new buffer. Its blocks are
+    // armed with owned words (GuestMemory::ArmOwnedBlocks) before the copy; the copy is current
+    // while OwnedProofHolds at the tracker generation read before the copy (no CPU store since the
+    // arming, no stamp or untracked hint newer), the registry and the forget serial are unchanged.
+    // The caller checks the pending writes first, as for every draw snapshot. An entry whose
+    // words moved backs off arming (2^n - 1 misses, n <= 6); a hit clears the back-off.
+    // `arm`: whether the caller should arm and keep its copy.
+    static constexpr std::size_t OwnedSnapshotBudget = std::size_t{1024} << 20u;
+    // Vertex and index inputs (CopyDrawInput, APS5_NO_OWNED_VERTEX_INPUTS=1 off) share the cache, keyed
+    // by their use as well and keeping the derived word (an index buffer's highest index).
+    // APS5_VERIFY_OWNED_SNAPSHOTS=<n>: the first n hits per 10 s also compare the copy with guest
+    // memory (counted, a difference printed).
+    static constexpr std::size_t OwnedSnapshotEntries = 16384;
+    enum class OwnedSnapshotMiss : std::uint8_t { None, Absent, BackingOff, WordsMoved, StampsMoved, Mapping, Count };
+    std::shared_ptr<Buffer> OwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, bool& arm, OwnedSnapshotMiss& miss, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
+    void KeepOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::vector<std::uint64_t> words, std::uint64_t since, std::uint64_t registryGeneration, std::uint64_t forgetSerial, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    void RefuseOwnedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage);
+    static std::array<std::uint64_t, 2> OwnedSnapshotVerifyCounts();
+    std::size_t OwnedSnapshotBytes() const { return ownedSnapshotBytes; }
+    // Whether the storage snapshot held for the range is stale only through the driver's stamps (GPU writes, its own
+    // in-order stores), with no CPU store collected since: the caller collected the range first. Then the draw binds the
+    // range in place (its reads are noted pending, so a CPU-side store over them waits or goes to the GPU in order) and
+    // the snapshot is left as it is, neither refreshed nor dropped.
+    bool DrawSnapshotGpuWrittenOnly(std::uint64_t address, std::size_t bytes) const;
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;
@@ -143,15 +376,25 @@ public:
     UploadSlice DrawUpload(std::size_t bytes);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
+    // C68: the kept highest index of the range when it is stale only through the driver's stamps (GPU writes; the
+    // caller collected the range's CPU stores first); the entry stays as it is. Nothing when none is kept, the
+    // registry moved, it is current, or a CPU store stamped a changed block.
+    std::optional<std::optional<std::uint32_t>> GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
+    // The generation the kept highest index of the range was read at (0 when none is kept).
+    std::uint64_t KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
+    void OweHostRead();
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // Whether a pending write over the range is in a batch of the other lane than the calling
+    // thread's (open, or in flight): this lane's own pending writers run before what it records next.
+    bool PendingWriteOtherLane(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -175,6 +418,9 @@ public:
     // on the open batch, no snapshot: the only reader holds the mutex. `kind` names the reader for
     // the [recorder] hit counters. APS5_COPY_READ_TRACKING=0 notes nothing (ReadTracking() is then
     // false and the CPU copy falls back to Idle()).
+    // AddressBasedReadOnly: the lease of an address-based build whose shaders never store through
+    // BDA, so it marks no guest page at its completion; PendingWriterSerial does not wait for it
+    // (APS5_NO_READ_ONLY_LEASE_SKIP=1 notes such leases as AddressBased, as before).
     enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, AddressBasedReadOnly, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
@@ -209,6 +455,13 @@ public:
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const;
     std::uint64_t PendingLeaseSerial(std::uint64_t address, std::size_t bytes) const;
+    struct WriterWait {
+        std::array<std::uint64_t, 2> targets{};
+        std::size_t leftInFlight = 0;
+        std::size_t leftOpen = 0;
+    };
+    WriterWait FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd);
+    bool WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -223,6 +476,29 @@ public:
         std::size_t batchesToFinish;
     };
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
+    // APS5_PROFILE_DRAW attribution of pending-write notes (the [htile] writer list): the thread
+    // that notes a write names the program it records (SetWriteOrigin, 0 = none) and, for a
+    // dispatch of the HTILE mask kernel's code, its mask and value words; each note keeps the
+    // packet tag, the origin and its range in a ring that OriginOfNote reads back.
+    struct WriteOrigin {
+        std::uint64_t note = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t program = 0;
+        std::uint32_t opcode = 0;
+        std::uint32_t queue = 0;
+        std::uint32_t mask = 0;
+        std::uint32_t value = 0;
+        bool kernel = false;
+    };
+    static void SetWriteOrigin(std::uint64_t program);
+    static void SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value);
+    static std::uint64_t CurrentWriteOrigin();
+    enum class CheckpointKind : std::uint64_t { Draw = 0x1, CopyIn = 0xf1, CopyBack = 0xf2, DiffCopyBack = 0xf3, BindlessPublish = 0xf4, DmaCopy = 0xf5, GpuCopies = 0xf6, BatchBegin = 0xb0, BatchEnd = 0xb1, AsyncDispatch = 0xb2 };
+    static void SetCheckpointFunction(PFN_vkCmdSetCheckpointNV function);
+    static bool CheckpointsOn();
+    static void Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value);
+    static std::optional<WriteOrigin> OriginOfNote(std::uint64_t note);
     // Ends and submits the open batch without waiting.
     void Submit();
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
@@ -240,17 +516,21 @@ public:
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
+    void FinishThroughOpened(std::uint64_t serial);
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();
     bool CountingSamples() const { return countingSamples; }
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
-    bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0);
+    // APS5_STAGING_DIFF=1 (GuestBufferMemory::RecordCopyBacks): stores into `target` the dwords of
+    // `result` that differ from `pristine` (all three device addresses, `dwords` long), with the
+    // stored count added to StagingDiffStoredDwords when `count`. False when the kernel is unavailable.
+    bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count);
+    std::uint64_t StagingDiffStoredDwords();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
     void NoteDrawTraceToken(std::uint64_t token) noexcept;
-    void NoteFaultToken(AgcDriver::FaultToken token) noexcept;
     bool QueuesSampleDumps() const;
     void PrepareSampleSlot();
     void EndPassSamples();
@@ -283,6 +563,10 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    // Lock-free: the serial the work recorded now will carry (the open batch's, or the next one's),
+    // and the newest serial whose batch and every earlier one finished (their GPU work is done).
+    std::uint64_t UseSerial() const { return submittedSerial.load(std::memory_order_acquire) + 1; }
+    std::uint64_t RetiredSerial() const { return retiredSerial.load(std::memory_order_acquire); }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -304,12 +588,12 @@ public:
     // transfer-to-transfer barrier first (WAW). Debug aids: APS5_LABEL_RUNS_INLINE=1 records the
     // stores at once and closes the run at the next command (Commands()) or at Submit, as
     // before; APS5_NO_LABEL_RUNS=1 gives every store barriers of its own.
-    void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address);
+    void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address, std::source_location where = std::source_location::current());
     bool HasQueuedStores() const { return open != nullptr && !open->run.queued.empty(); }
     bool QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's guest range.
     bool AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
-    void FlushStores();
+    void FlushStores(std::source_location where = std::source_location::current());
     void FlushStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedStores() && QueuedStoreOverlaps(address, bytes)) FlushStores(); }
 
     // Pending-label table. A GPU label (RELEASE_MEM/WRITE_DATA recorded as a store into the batch)
@@ -374,13 +658,7 @@ public:
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
-    struct OwnLabel {
-        std::uint64_t value = 0;
-        std::uint64_t mask = 0;
-    };
-    static OwnLabel UnlandedOwnLabel(std::uint64_t address, std::size_t bytes, std::uint32_t queue);
     static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
-    static bool LookupStoredBytes(std::uint64_t address, std::span<std::byte> bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
     // enters the table with no batch, and only a lookup made on the noting thread (a WAIT_REG_MEM
     // of the same queue) takes its value, since that queue's later work follows the label in queue
@@ -398,7 +676,6 @@ public:
     // The function the flush hook calls, on the accessing thread (which may hold the GPU mutex),
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
-    static void FailNextSubmitsForTest(unsigned count);
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
@@ -452,14 +729,11 @@ public:
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
     static void CountRecordedWork();
-    bool NoteGuestWork(VkCommandBuffer commands);
 
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
     VkDevice Device() const { return context.device; }
-    std::uint64_t Id() const { return id; }
-    static bool Alive(std::uint64_t id);
     // Whether the calling thread runs inside a batch's completion action (finish()): a store made
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();
@@ -509,13 +783,9 @@ public:
     // queries around each timed range; the totals per key are reported every 10 s. Begin returns the
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
-    static constexpr std::uint64_t DrawTimingFlag = std::uint64_t{1} << 63u;
-    static constexpr std::uint64_t DrawTimingKey(std::uint64_t variantId) { return variantId | DrawTimingFlag; }
-    static std::string TimingKeyLabel(std::uint64_t key);
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
-    std::uint32_t BeginInPassGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
@@ -561,12 +831,12 @@ public:
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
+    // APS5_PROFILE_GPU: prints the [gputime] line of the batches read so far as the window `label`
+    // and starts the next window (ProfileWindows::Close; nothing when the timing is off).
+    static void CloseGpuTimingWindow(const char* label);
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
     // StorageTexture's write-back hysteresis.
     static std::uint64_t Presents();
-    static void NoteFrameGpuBusy(double milliseconds);
-    static std::pair<std::uint64_t, double> FrameGpuBusy();
-    static void RequestBatchStamps();
 
     // What the presenter learns about finished batches (Driver::Present's [present] line and the
     // frame record): finish() writes an entry per submitted batch into a ring of the last 128,
@@ -579,6 +849,8 @@ public:
         std::uint64_t serial = 0;
         double gpuStartNs = 0;
         double gpuEndNs = 0;
+        // The batch's lane (1: the async compute lane, see AsyncLaneRing).
+        int lane = 0;
         std::chrono::steady_clock::time_point submittedAt{};
         std::chrono::steady_clock::time_point fenceSeenAt{};
         std::uint64_t readGeneration = 0;
@@ -596,21 +868,12 @@ public:
     static bool FlipReadCheck();
 
 private:
-    struct Batch;
-    struct WideLabel {
-        std::uint64_t end;
-        std::vector<std::byte> bytes;
-        std::uint64_t sequence;
-        bool overwritten = false;
-        const Batch* batch = nullptr;
-    };
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
-        std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
@@ -631,13 +894,15 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
-        std::uint64_t predictedSerial = 0;
-        AgcDriver::FaultToken firstToken = 0;
-        AgcDriver::FaultToken lastToken = 0;
+        // OpenSerial() when the batch was opened: its serial is at least this (see CompletedThrough).
+        std::uint64_t openedAt = 0;
+        // Its lane (see AsyncLaneRing), and the other lane's serial it waits for on the GPU (0: none).
+        int lane = 0;
+        std::uint64_t waitOther = 0;
+        bool handedOut = false;
+        std::uint64_t edgeOwed = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
-        bool guestWork = false;
-        std::atomic<bool> submitStarted{false};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -663,7 +928,7 @@ private:
         std::uint64_t readGeneration = 0;
         // Dword addresses this batch noted in the label table (removed when it finishes).
         std::vector<std::uint64_t> labelDwords;
-        std::vector<std::multimap<std::uint64_t, WideLabel>::iterator> wideLabels;
+        std::vector<std::multimap<std::uint64_t, std::uint64_t>::iterator> wideLabels;
         // Labels stored by this batch's completion actions (see AfterCompletions); subtracted from
         // the lock-free pending count when the batch finishes, whether or not its completions ran.
         std::uint32_t completionLabelCount = 0;
@@ -704,10 +969,37 @@ private:
         } run;
         // See Commands(): the accesses the last recorded command's trailing barrier covers.
         VkAccessFlags coveredAccess = 0;
+        // See DeferDispatchBarrier: the guest queue key of the dispatch whose trailing barrier is
+        // still owed (0: none).
         std::uint32_t deferredDispatchQueue = 0;
+        // The resources objects of the dispatches of the open run (see OverlapCommands).
         std::vector<const void*> deferredRun;
-        std::vector<RunAccess> runAccess;
+        // See AfterRun.
         std::vector<std::function<void(Recorder&)>> afterRun;
+        // See NoteRunAccess: {begin, end, flags, program} of the open run's dispatches, and the copied
+        // regions with atomics among them (RunAtomicConflict).
+        std::vector<std::array<std::uint64_t, 4>> runAccess;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runCopiedAtomic;
+        // Command buffers recorded before `commands`, in submission order (SplitForRun): ended, but
+        // for an open prelude, which sealPrelude ends.
+        std::vector<VkCommandBuffer> chunks;
+        // See SplitForRun: `armed` from a split until the run closes; `commands` once a copy-in used
+        // it (also in `chunks`); the pristine copies it owes at its end.
+        struct Prelude {
+            bool armed = false;
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            struct Pristine {
+                VkBuffer shadow;
+                VkBuffer pristine;
+                VkDeviceSize bytes;
+            };
+            std::vector<Pristine> pristine;
+        } prelude;
+        // See AfterRunMerging: while the run's copy-backs record, the guest ranges they wrote since
+        // the last barrier, and whether any wrote.
+        bool afterRunMerging = false;
+        bool afterRunWrote = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> afterRunWritten;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -729,8 +1021,8 @@ private:
             bool fenced = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            PassBinding bound;
             std::function<void(VkCommandBuffer)> afterPass;
-            PassBreak closedBy = PassBreak::NewBatch;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
@@ -763,6 +1055,8 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    std::string runningRanges(const Batch& batch);
+    std::string laneState(const Batch& batch) const;
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
     bool gpuSampleCounter();
@@ -789,9 +1083,12 @@ private:
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
-    int changedCopyState = 0;
-    VkPipelineLayout changedCopyLayout = VK_NULL_HANDLE;
-    VkPipeline changedCopyPipeline = VK_NULL_HANDLE;
+    int stagingDiffState = 0;
+    VkPipelineLayout stagingDiffLayout = VK_NULL_HANDLE;
+    VkPipeline stagingDiffPipeline = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer> stagingDiffCounter;
+    std::uint64_t stagingDiffStored = 0;
+    std::uint32_t stagingDiffSeen = 0;
     int sampleCounterState = 0;
     std::unique_ptr<Buffer> sampleCounter;
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;
@@ -833,9 +1130,9 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
-    void flushDeferredDispatch();
-    bool runConflict(std::span<const RunAccess> accesses) const;
-    bool joinsRun(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses) const;
+    // Records a deferred dispatch trailing barrier (see DeferDispatchBarrier), if any.
+    // `where`: the caller that closes the run (APS5_PROFILE_DRAW: [run-close] counts by call site).
+    void flushDeferredDispatch(std::size_t site, const std::source_location& where = std::source_location::current());
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
@@ -844,7 +1141,7 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
-    void endOpenRenderPass(PassBreak by, bool barrier = true);
+    void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
@@ -859,6 +1156,7 @@ private:
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    static bool writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;
@@ -883,8 +1181,6 @@ private:
     std::uint64_t writtenBackSequence = 0;
     // PendingLabel without the table mutex (the caller holds it, or the GPU mutex).
     std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const;
-    bool storedBytesLocked(std::uint64_t address, std::span<std::byte> bytes) const;
-    OwnLabel unlandedOwnLabel(std::uint64_t address, std::size_t bytes, std::uint32_t queue) const;
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
@@ -905,15 +1201,71 @@ private:
     // The queued entries (batch always null), by dword; a lookup on the noting queue's thread
     // prefers them (its newest store in program order), every other lookup sees `labels` alone.
     std::map<std::uint64_t, LabelEntry> queuedLabels;
-    std::multimap<std::uint64_t, WideLabel> wideLabels;
+    std::multimap<std::uint64_t, std::uint64_t> wideLabels;
     std::uint64_t wideLabelBytes = 0;
-    std::uint64_t wideLabelSequence = 0;
-    std::atomic<std::size_t> recordedWideLabels{0};
     bool wideLabelInLocked(std::uint64_t address, std::size_t bytes) const;
     // labels.size(), readable without the table mutex: a noted write skips the mutex while the
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
-    std::unique_ptr<Batch> open;
+    // The open batch of each lane, and `open`: the calling thread's lane's slot (the thread's lane,
+    // see LaneScope, while the async lane is active; else lane 0), used like the one open batch.
+    std::array<std::unique_ptr<Batch>, 2> lanes;
+    int currentLane() const;
+    struct OpenSlot {
+        Recorder* owner;
+        std::unique_ptr<Batch>& slot() const { return owner->lanes[static_cast<std::size_t>(owner->currentLane())]; }
+        Batch* get() const { return slot().get(); }
+        Batch* operator->() const { return get(); }
+        Batch& operator*() const { return *get(); }
+        explicit operator bool() const { return get() != nullptr; }
+        bool operator==(std::nullptr_t) const { return get() == nullptr; }
+        bool operator!=(std::nullptr_t) const { return get() != nullptr; }
+    };
+    OpenSlot open{this};
+    template<typename TFunction>
+    bool anyOpen(TFunction&& function) const {
+        for (const auto& batch : lanes) {
+            if (batch != nullptr && function(*batch)) return true;
+        }
+        return false;
+    }
+    template<typename TFunction>
+    void forEachOpen(TFunction&& function) const {
+        for (const auto& batch : lanes) {
+            if (batch != nullptr) function(*batch);
+        }
+    }
+    VkSemaphore asyncTimeline = VK_NULL_HANDLE;
+    // The newest serial submitted to each lane.
+    std::array<std::uint64_t, 2> laneSubmitted{};
+    // The other lane's serial the next batch of each lane must wait for (LaneSwitch).
+    std::array<std::uint64_t, 2> laneOwed{};
+    void switchEdge(int from, int to, bool retroactive = false);
+    void addEdge(int lane, std::uint64_t serial, bool retroactive = false);
+    void takeOwedEdge();
+    // Submits `lane`'s open batch (from any thread's lane).
+    void submitLane(int lane);
+    // Before a blocking CPU wait for `awaited` (in flight, fence unsignaled): submits the other
+    // lane's open batch. The two rings run side by side on the hardware, so the awaited work may
+    // wait on the GPU for (spin on memory written by) the other ring's later work; left open, that
+    // work reaches the GPU only through a submit by this thread, which holds the GPU mutex every
+    // other driver thread queues on (the #675 lane-1 freeze: FinishWritersByLane -> finish on a
+    // lane-1 batch, lane 0 open). Async lane only (APS5_NO_LANE_OPEN_WAIT=1: as before).
+    void submitOtherLaneBeforeWait(const Batch& awaited);
+    void submitOtherLaneBeforeWait(int lane, std::uint64_t serial);
+    // The edges this thread's consumed labels owe (NoteConsumedLabel), applied to the open batch.
+    void applyConsumedLabels();
+    // The newest in-flight batch of `lane`, or null.
+    Batch* newestInFlight(int lane) const;
+    // Finishes, in serial order, the in-flight batches of `lane` with serial <= `target` (first the
+    // other lane's batches each of them waits for), waiting for their fences when `wait`.
+    void finishLaneThrough(int lane, std::uint64_t target, bool wait, int source);
+    // The newest serial of `lane` <= `serial` not yet retired (0: none). Callable without the GPU
+    // mutex (WaitSerial waits unlocked): it reads `laneLog` under its own mutex.
+    std::uint64_t laneTargetAtOrBefore(int lane, std::uint64_t serial) const;
+    // (serial, lane) of every submitted batch not yet below the retired serial (async lane only).
+    mutable std::mutex laneLogMutex;
+    std::deque<std::pair<std::uint64_t, int>> laneLog;
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
@@ -921,12 +1273,22 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
+    mutable ::AgcDriver::Graphics::PendingWriteRanges pendingWriteRanges;
     std::uint64_t submissions = 0;
+    std::atomic<std::uint64_t> submittedSerial{0};
+    std::atomic<std::uint64_t> retiredSerial{0};
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
-    std::vector<VkFence> spare;
+    // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
+    // frame would otherwise allocate and free their objects each time).
+    std::array<std::vector<std::pair<VkCommandBuffer, VkFence>>, 2> spare;
+    VkCommandPool poolOf(int lane) const { return lane == 1 && context.asyncPool != VK_NULL_HANDLE ? context.asyncPool : context.pool; }
+    // Extra command buffers of completed batches (SplitForRun, preludes), reused likewise.
+    std::array<std::vector<VkCommandBuffer>, 2> spareChunks;
+    VkCommandBuffer beginChunk();
+    void sealPrelude();
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;
@@ -951,6 +1313,23 @@ private:
         VkDeviceSize offset = 0;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    using OwnedSnapshotKey = std::tuple<std::uint64_t, std::size_t, SnapshotUse>;
+    struct OwnedSnapshot {
+        std::vector<std::uint64_t> words;
+        std::uint64_t since = 0;
+        std::uint64_t registryGeneration = 0;
+        std::uint64_t forgetSerial = 0;
+        std::shared_ptr<Buffer> buffer;
+        std::list<OwnedSnapshotKey>::iterator recent;
+        std::uint8_t backoff = 0;
+        std::uint16_t skip = 0;
+        std::uint32_t derived = 0;
+    };
+    std::map<OwnedSnapshotKey, OwnedSnapshot> ownedSnapshots;
+    std::list<OwnedSnapshotKey> ownedSnapshotRecency;
+    std::size_t ownedSnapshotBytes = 0;
+    OwnedSnapshot& ownedSnapshotEntry(const OwnedSnapshotKey& key);
+    void dropOwnedSnapshotBuffer(OwnedSnapshot& entry);
     std::array<std::uint64_t, 3> unwrittenStamp{};
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
@@ -966,17 +1345,7 @@ private:
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
-    mutable bool publishedWriteRangesValid = false;
 };
-
-inline void EmitNvCheckpointToken(VkCommandBuffer commands, AgcDriver::FaultToken token, PFN_vkCmdSetCheckpointNV setCheckpoint) noexcept {
-    try {
-        if (commands == VK_NULL_HANDLE || setCheckpoint == nullptr || token == 0) return;
-        setCheckpoint(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(token)));
-    } catch (...) {
-    }
-}
 
 }
 

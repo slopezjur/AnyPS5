@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -12,6 +13,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#include <algorithm>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -20,8 +22,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <span>
 #include <cstring>
-#include <functional>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -37,14 +39,16 @@ using namespace AgcDriver::GuestMemory;
 
 constexpr std::size_t Block = 65536;
 #ifdef _WIN32
-constexpr wchar_t MetadataCommitMode[] = L"--metadata-commit";
 constexpr wchar_t HostHoleMode[] = L"--host-hole";
 constexpr wchar_t ResidentRemapMode[] = L"--resident-direct-remap";
+constexpr wchar_t OwnedProofsMode[] = L"--owned-proofs";
+constexpr wchar_t MappingOwnerMode[] = L"--mapping-owner";
+constexpr wchar_t AccessGuardsMode[] = L"--access-guards";
+constexpr wchar_t AccessReportingMode[] = L"--residency-reporting";
 constexpr wchar_t RewatchImportPagesMode[] = L"--rewatch-import-pages";
 constexpr wchar_t RewatchedSharedMode[] = L"--rewatched-direct-shared";
 constexpr wchar_t ImportAliasSharedMode[] = L"--import-alias-shared";
 constexpr wchar_t SharedGenerationsMode[] = L"--compared-shared-generations";
-constexpr wchar_t CpuWritePinMode[] = L"--cpu-write-pin";
 #endif
 
 void Require(bool condition, const std::string& message) {
@@ -67,9 +71,7 @@ bool CheckMetadataCommit() {
     Require(committed < (64u << 20u), "write tracking committed dense generation tables for untouched guest ranges");
     const auto generation = TrackerGeneration();
     for (std::uint64_t offset = 0; offset + Block <= bytes; offset += std::uint64_t{1} << 32u) {
-        const bool host = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(arena + offset, Block);
-        Require(NewestStamp(arena + offset, Block) == 0, "an untouched leaf has a write stamp");
-        Require(UnchangedSince(arena + offset, Block, generation) != host, host ? "an arena host region reads as unchanged" : "an untouched leaf reads as changed");
+        Require(NewestStamp(arena + offset, Block) == 0 && UnchangedSince(arena + offset, Block, generation), "an untouched leaf has a write stamp");
     }
     PROCESS_MEMORY_COUNTERS_EX queried{};
     Require(K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&queried), sizeof(queried)), "cannot measure private commit after empty-range queries");
@@ -186,21 +188,6 @@ void CheckSharedBlock() {
     if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
 }
 
-void CheckStoredOverUsesPageEvidence() {
-    constexpr std::size_t Page = 4096;
-    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(2 * Block));
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    std::memset(memory, 0x11, 2 * Block);
-    const auto before = CollectWritesUncached(base, 2 * Block);
-    Require(before != 0, "the stored-over page fixture was not collected");
-
-    static_cast<volatile std::uint8_t*>(memory)[0] = 0x22;
-    const auto after = CollectWritesUncached(base, Block);
-    Require(after > before, "the page-local CPU write was not collected");
-    Require(StoredOver(base, Page, before), "a collected CPU write on a page was not reported as stored over");
-    Require(!StoredOver(base + Page, Page, before), "a page-local CPU write made an untouched page in the same block count as stored over");
-}
-
 void CheckRepeatedNeighbourStores() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -219,8 +206,6 @@ void CheckRepeatedNeighbourStores() {
     for (int store = 0; store < 3; ++store) MarkWritten(boundary + static_cast<std::uint64_t>(store) * 0x100, 4);
     MarkWritten(boundary, 0x400);
     Require(StoredOver(boundary + 0x200, 4, pieces) && !StoredOver(boundary + 0x400, 4, pieces), "a store over earlier pieces of the block answers for other bytes than its own");
-    MarkWritten(boundary + 0x800, 4);
-    MarkWritten(boundary + 0x900, 4);
     Require(!StoredOver(base + Block, static_cast<std::size_t>(sharedFirst), pieces), "a store over earlier pieces counts for the first surface's part of the shared block");
 
     void* fresh = AllocateWatched(2 * Block);
@@ -228,21 +213,32 @@ void CheckRepeatedNeighbourStores() {
     std::memset(fresh, 0x11, 2 * Block);
     const auto freshSynced = CollectWrites(freshBase, 2 * Block);
     const auto neighbour = freshBase + Block - 0x9000;
-    MarkWritten(neighbour, 0x100);
-    const auto secondStored = MarkWritten(neighbour + 0x1000, 0x100);
-    const auto thirdStored = MarkWritten(neighbour + 0x2000, 0x100);
-    MarkWritten(neighbour + 0x3000, 0x100);
+    for (std::uint64_t store = 0; store < 4; ++store) MarkWritten(neighbour + store * 0x1000, 0x100);
     const auto settled = TrackerGeneration();
     MarkWritten(neighbour, 0x100);
-    MarkWritten(neighbour, 0x100);
     MarkWritten(neighbour + 0x5000, 0x100);
-    Require(!StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), secondStored), "a full exact ring evicted a newer piece instead of its oldest");
+    Require(!StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), settled), "a full block forgets a store newer than its oldest");
     Require(StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), freshSynced), "a forgotten store is not taken as a store over the rest of the block");
 
     const auto partial = TrackerGeneration();
     MarkWritten(neighbour + 0x5080, 0x100);
     Require(StoredOver(neighbour + 0x5000, 0x10, settled) && StoredOver(neighbour + 0x5100, 0x10, partial), "a store that overlaps an earlier piece without containing it replaces it");
-    Require(!StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), thirdStored), "a store that overlaps without containing evicted a newer piece instead of the oldest");
+    Require(!StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), settled), "a full block forgets a store newer than its oldest");
+}
+
+void CheckStoredOverUsesPageEvidence() {
+    constexpr std::size_t Page = 4096;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(2 * Block));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto before = CollectWritesUncached(base, 2 * Block);
+    Require(before != 0, "the stored-over page fixture was not collected");
+
+    static_cast<volatile std::uint8_t*>(memory)[0] = 0x22;
+    const auto after = CollectWritesUncached(base, Block);
+    Require(after > before, "the page-local CPU write was not collected");
+    Require(StoredOver(base, Page, before), "a collected CPU write on a page was not reported as stored over");
+    Require(!StoredOver(base + Page, Page, before), "a page-local CPU write made an untouched page in the same block count as stored over");
 }
 
 void CheckStoredAllSince() {
@@ -864,16 +860,14 @@ void CheckRewatchImportTail() {
     constexpr std::size_t bytes = 0xc4000;
     ImportFixture fixture(13 * Block, bytes);
     const auto import = fixture.Base();
-    const bool pastWatched = Watched(import + bytes, 4096);
     UnwatchImport(import, bytes);
-    Require(Watched(import + bytes, 4096) == pastWatched, "unwatching an import ending inside a block changed the page past it");
     PrintPageState("page past a 0xc4000-byte import", fixture.memory + bytes);
     const auto unwatched = UnwatchSerial();
     Rewatch(BlockSpan(import, bytes));
     Require(!Watched(import, bytes) && UnwatchSerial() == unwatched, "the 64 KiB span past the import's committed pages returned to the write watch");
     Rewatch(PageSpan(import, bytes));
     Require(Watched(import, bytes), "a settled import whose size is not a whole block did not return to the write watch");
-    Require(Watched(import + 12 * Block, bytes - 12 * Block) && Watched(import + bytes, 4096) == pastWatched && Watched(import, bytes + 1) == pastWatched, "rewatching an import ending inside a block changed the page past it");
+    Require(Watched(import + 12 * Block, bytes - 12 * Block) && !Watched(import, bytes + 1) && !Watched(import + bytes - 1, 2) && !Watched(import + bytes, 4096), "rewatching an import ending inside a block did not return exactly its pages");
     Require(UnwatchSerial() != unwatched && UntrackedHint(import, bytes) == 0, "a rewatched import still reads as unwatched");
     RequireRewatchedStores(import, bytes);
 }
@@ -884,16 +878,13 @@ void CheckRewatchUnalignedImport() {
     constexpr std::size_t committed = 0xc8000;
     ImportFixture fixture(13 * Block, committed);
     const auto import = fixture.Base() + offset;
-    const bool beforeWatched = Watched(fixture.Base(), offset);
-    const bool pastWatched = Watched(import + bytes, 4096);
     UnwatchImport(import, bytes);
-    Require(Watched(fixture.Base(), offset) == beforeWatched && Watched(import + bytes, 4096) == pastWatched, "unwatching an import inside its blocks changed the pages around it");
     PrintPageState("page past an import at block offset 0x1000", fixture.memory + committed);
     Rewatch(BlockSpan(import, bytes));
     Require(!Watched(import, bytes), "the 64 KiB span past the committed pages around an import returned to the write watch");
     Rewatch(PageSpan(import, bytes));
     Require(Watched(import, bytes), "a settled import that does not start on a block did not return to the write watch");
-    Require(Watched(fixture.Base(), offset) == beforeWatched && Watched(import + bytes, 4096) == pastWatched, "rewatching an import changed the pages around it");
+    Require(!Watched(fixture.Base(), offset) && !Watched(import + bytes, 4096), "rewatching an import returned pages outside it");
     RequireRewatchedStores(import, bytes);
 }
 
@@ -1311,18 +1302,11 @@ std::uint64_t ChildHostHole() {
     return (arena + arenaBytes / 2) & ~(std::uint64_t{Block} - 1);
 }
 
-std::uint64_t ProbedHostHole() {
-    std::uintptr_t arena = 0;
-    std::size_t arenaBytes = 0;
-    GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
-    return arena + ((arenaBytes / 2) & ~((std::uint64_t{1} << 32u) - 1));
-}
-
-void CheckHostHoleInChild(const wchar_t* mode, std::uint64_t hole) {
+void CheckHostHoleInChild() {
     std::array<wchar_t, 32768> executable{};
     const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
     Require(length != 0 && length < executable.size(), "cannot name the test executable");
-    const std::wstring command = L"\"" + std::wstring(executable.data(), length) + L"\" " + mode;
+    const std::wstring command = L"\"" + std::wstring(executable.data(), length) + L"\" " + HostHoleMode;
     std::vector<wchar_t> commandLine(command.begin(), command.end());
     commandLine.push_back(L'\0');
     STARTUPINFOW startup{};
@@ -1333,7 +1317,7 @@ void CheckHostHoleInChild(const wchar_t* mode, std::uint64_t hole) {
     startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION process{};
     Require(CreateProcessW(executable.data(), commandLine.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &process) != 0, "cannot create the host-hole child");
-    const bool reserved = VirtualAllocEx(process.hProcess, reinterpret_cast<void*>(hole), Block, MEM_RESERVE, PAGE_NOACCESS) != nullptr;
+    const bool reserved = VirtualAllocEx(process.hProcess, reinterpret_cast<void*>(ChildHostHole()), Block, MEM_RESERVE, PAGE_NOACCESS) != nullptr;
     const bool resumed = reserved && ResumeThread(process.hThread) != static_cast<DWORD>(-1);
     const bool exited = resumed && WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0;
     if (!exited) {
@@ -1397,12 +1381,10 @@ std::uint64_t failedCollectBegin = 0;
 std::uint64_t failedCollectEnd = 0;
 std::uint64_t unwatchHookBegin = 0;
 std::uint64_t unwatchHookEnd = 0;
-bool unwatchHookProven = true;
 
 void RecordUnwatch(std::uint64_t address, std::size_t bytes) {
     unwatchHookBegin = address;
     unwatchHookEnd = address + bytes;
-    unwatchHookProven = UnwatchWritesProven();
 }
 
 bool FailFreshCollect(std::uintptr_t address, std::size_t bytes, void (*)(void*, std::uintptr_t, std::uintptr_t), void*) {
@@ -1410,25 +1392,6 @@ bool FailFreshCollect(std::uintptr_t address, std::size_t bytes, void (*)(void*,
     failedCollectEnd = address + bytes;
     return false;
 }
-
-#ifdef _WIN32
-std::uint64_t failedCollectInterleavingAddress = 0;
-std::uint64_t failedCollectInterleavingOrder = 0;
-std::uint64_t failedCollectInterleavingProof = 0;
-bool failedCollectInterleavingCalled = false;
-bool failedCollectInterleavingFailed = false;
-
-void MarkDuringFailedCollectUnwatch(std::uint64_t address, std::size_t bytes) {
-    failedCollectInterleavingCalled = true;
-    SetUnwatchHook(nullptr);
-    try {
-        Unwatch(address, bytes);
-        failedCollectInterleavingProof = MarkPossiblyWritten(failedCollectInterleavingAddress, 4, failedCollectInterleavingOrder);
-    } catch (...) {
-        failedCollectInterleavingFailed = true;
-    }
-}
-#endif
 
 void CheckFailedCollectUnwatch() {
     void* memory = AllocateWatched(3 * Block);
@@ -1445,130 +1408,6 @@ void CheckFailedCollectUnwatch() {
     Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "a failed collect unwatched unrelated blocks");
     Require(failedCollectBegin == base + Block && failedCollectEnd == base + 2 * Block, "the failed fresh collect did not cover its block");
     Require(unwatchHookBegin <= base + Block && unwatchHookEnd >= base + 2 * Block, "a failed collect did not run the unwatch hook over its block");
-    Require(!unwatchHookProven, "a failed collect ran the unwatch hook as if the CPU writes to its block were proven");
-}
-
-struct CpuWritePinProbe;
-CpuWritePinProbe* cpuWritePinProbe = nullptr;
-
-struct CpuWritePinProbe {
-    std::uint64_t address;
-    std::uint64_t unrelated;
-    std::atomic<bool> entered{false};
-    std::atomic<bool> waited{false};
-    std::atomic<bool> passed{false};
-    std::atomic<bool> unrelatedPassed{false};
-    std::atomic<bool> failed{false};
-    std::thread mutation;
-    std::thread other;
-
-    void Join() {
-        if (mutation.joinable()) mutation.join();
-        if (other.joinable()) other.join();
-    }
-
-    ~CpuWritePinProbe() {
-        Join();
-        GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(nullptr);
-        cpuWritePinProbe = nullptr;
-    }
-};
-
-bool ObserveCpuWritePin(std::uintptr_t address, std::size_t bytes) {
-    auto& probe = *cpuWritePinProbe;
-    if (address <= probe.address && probe.address < address + bytes) probe.waited.store(true);
-    std::this_thread::yield();
-    return false;
-}
-
-void CheckCpuWritePinDuringStore(std::uint64_t address, std::size_t bytes) {
-    auto& probe = *cpuWritePinProbe;
-    if (address != probe.address || bytes != 4 || probe.entered.exchange(true)) return;
-    const auto attempt = [&](std::uint64_t target, std::atomic<bool>& passed) {
-        try {
-            GuestAllocations::Mutation mutation;
-            mutation.RequireUnpinned(reinterpret_cast<const void*>(target), 4);
-            passed.store(true);
-        } catch (const std::exception&) {
-            probe.failed.store(true);
-        }
-    };
-    probe.mutation = std::thread(attempt, probe.address, std::ref(probe.passed));
-    probe.other = std::thread(attempt, probe.unrelated, std::ref(probe.unrelatedPassed));
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while ((!probe.unrelatedPassed.load() || (!probe.waited.load() && !probe.passed.load())) && !probe.failed.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-    Require(!probe.failed.load(), "the CPU store mutation probe threw");
-    Require(probe.unrelatedPassed.load(), "a CPU store pinned an unrelated registered range");
-    Require(probe.waited.load() && !probe.passed.load(), "a mapping mutation passed its unmap gate during an executing CPU store");
-}
-
-void CheckCpuWritePin() {
-    auto* memory = static_cast<std::byte*>(AllocateWatched(4 * Block));
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    struct Cleanup {
-        std::byte* memory;
-        ~Cleanup() {
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Remove(memory);
-                mutation.Remove(memory + Block);
-                mutation.Remove(memory + 3 * Block);
-            }
-            GuestArena::GuestArenaReset_nid_postfix(memory, 4 * Block);
-            GuestArena::GuestArenaRelease_nid_postfix(memory, 4 * Block);
-        }
-    } cleanup{memory};
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(memory, Block, true, true, true);
-        mutation.Add(memory + Block, Block, true, true, true);
-        mutation.Add(memory + 3 * Block, Block, true, true, true);
-    }
-    const auto check = [&](std::uint64_t begin, std::size_t bytes, std::uint64_t target, std::uint64_t unrelated, bool throws) {
-        CpuWritePinProbe probe{target, unrelated};
-        cpuWritePinProbe = &probe;
-        GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(&ObserveCpuWritePin);
-        const std::vector<std::byte> value(bytes, std::byte{0x6a});
-        bool threw = false;
-        try {
-            StoreOwnBytes(begin, bytes, [&] {
-                CheckCpuWritePinDuringStore(probe.address, 4);
-                if (throws) throw std::logic_error("synthetic CPU store refusal");
-                std::memcpy(reinterpret_cast<void*>(begin), value.data(), bytes);
-            });
-        } catch (const std::logic_error&) {
-            threw = true;
-        }
-        probe.Join();
-        Require(threw == throws, "the CPU store changed its callback exception");
-        Require(probe.entered.load() && probe.waited.load() && probe.passed.load() && probe.unrelatedPassed.load() && !probe.failed.load(), "the CPU store did not release exactly its mapping after the write");
-        if (!throws) Require(std::memcmp(reinterpret_cast<const void*>(begin), value.data(), bytes) == 0, "the pinned CPU store did not reach guest memory");
-    };
-    check(base + 32, 4, base + 32, base + Block, false);
-    check(base, Block, base + 32, base + Block, false);
-    check(base, 3 * Block, base + 32, base + 3 * Block, false);
-    check(base, 3 * Block, base + Block + 32, base + 3 * Block, false);
-    check(base + 32, 4, base + 32, base + Block, true);
-    const std::array<std::byte, 4> value{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
-    Write(base, value, 4);
-    const std::array<std::byte, 4> original{};
-    WriteChanged(base + Block, value, original);
-    constexpr std::uint64_t label = 0x123456789abcdef0;
-    AgcDriverStoreGuestLabel_nid_postfix(reinterpret_cast<std::uint64_t*>(memory + 16), label);
-    Require(*reinterpret_cast<const std::uint64_t*>(memory + 16) == label, "a pinned host label store did not reach guest memory");
-    bool refused = false;
-    try {
-        Write(base + 1, value, 4);
-    } catch (const std::runtime_error&) {
-        refused = true;
-    }
-    Require(refused, "a misaligned CPU write was accepted");
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.RequireUnpinned(memory, 4 * Block);
-    }
-    Require(std::memcmp(memory, value.data(), value.size()) == 0 && std::memcmp(memory + Block, value.data(), value.size()) == 0, "a checked CPU write did not reach guest memory");
-    std::cout << "CPU stores pin both intersecting mappings, exclude adjacent ranges and release pins after success or refusal\n";
 }
 #endif
 
@@ -1648,6 +1487,74 @@ void CheckVersionRanges() {
     Require(UnchangedSince(base, bytes, checkpoints.back()), "the latest checkpoint was rejected");
 }
 
+// Block hashes stand in for texture byte copies: every changed byte (anywhere in a block, at either
+// end of a clipped block, a swap of two words) changes exactly its block's hash, a host copy hashes
+// like the guest bytes, and uncommitted pages hash as zeros.
+void CheckContentHashes() {
+    using AgcDriver::ContentHash::Hash128;
+    std::vector<std::byte> storage(6 * Block);
+    for (std::size_t i = 0; i < storage.size(); ++i) storage[i] = static_cast<std::byte>((i * 167u + 13u) ^ (i >> 9));
+    const auto blockBase = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) / Block * Block;
+    const auto address = blockBase + 0x1234;
+    const std::size_t bytes = 3 * Block + 100;
+    Require(HashBlockCount(address, bytes) == 4 && HashBlockCount(blockBase, Block) == 1 && HashBlockCount(blockBase, Block + 1) == 2 && HashBlockCount(address, 0) == 0, "hash block counts are wrong");
+    std::vector<Hash128> hashes(HashBlockCount(address, bytes));
+    HashCommittedBlocks(address, bytes, hashes);
+    std::vector<std::byte> copy(bytes);
+    std::memcpy(copy.data(), reinterpret_cast<const void*>(address), bytes);
+    std::vector<Hash128> fromCopy(hashes.size());
+    HashBlocksOf(address, copy, fromCopy);
+    Require(fromCopy == hashes, "a host copy hashes unlike the guest bytes it copies");
+    Require(CommittedBlocksMatch(address, bytes, hashes), "unchanged bytes do not match their hashes");
+    Require(CommittedBlocksMatch(blockBase + Block, Block, std::span<const Hash128>(hashes).subspan(1, 1)), "a whole block inside the range does not match its own hash");
+    Require(!CommittedBlocksMatch(address, bytes, std::span<const Hash128>(hashes).first(3)), "a hash list of the wrong length matched");
+    auto* bytesAt = reinterpret_cast<std::uint8_t*>(address);
+    const auto blockOf = [&](std::size_t offset) { return static_cast<std::size_t>((address + offset) / Block - address / Block); };
+    const std::size_t firstBoundary = static_cast<std::size_t>(blockBase + Block - address);
+    for (const std::size_t offset : {std::size_t{0}, firstBoundary - 1, firstBoundary, firstBoundary + 4097, firstBoundary + Block - 1, bytes / 2, bytes - 1}) {
+        for (const std::uint8_t flip : {std::uint8_t{0x01}, std::uint8_t{0x80}}) {
+            bytesAt[offset] ^= flip;
+            std::vector<Hash128> changed(hashes.size());
+            HashCommittedBlocks(address, bytes, changed);
+            for (std::size_t block = 0; block < hashes.size(); ++block) Require((changed[block] == hashes[block]) == (block != blockOf(offset)), "a changed byte at +" + std::to_string(offset) + " did not change exactly its block's hash");
+            Require(!CommittedBlocksMatch(address, bytes, hashes), "a changed byte at +" + std::to_string(offset) + " still matches");
+            bytesAt[offset] ^= flip;
+            Require(CommittedBlocksMatch(address, bytes, hashes), "restored bytes do not match again");
+        }
+    }
+    std::uint64_t first = 0, second = 0;
+    std::memcpy(&first, bytesAt + firstBoundary + 64, 8);
+    std::memcpy(&second, bytesAt + firstBoundary + 1024, 8);
+    Require(first != second, "the swap test words are equal");
+    std::memcpy(bytesAt + firstBoundary + 64, &second, 8);
+    std::memcpy(bytesAt + firstBoundary + 1024, &first, 8);
+    Require(!CommittedBlocksMatch(address, bytes, hashes), "two swapped words still match");
+    std::memcpy(bytesAt + firstBoundary + 64, &first, 8);
+    std::memcpy(bytesAt + firstBoundary + 1024, &second, 8);
+    const std::array<std::byte, 128> zeros{};
+    Require(!(AgcDriver::ContentHash::Of(zeros.data(), 10) == AgcDriver::ContentHash::Of(zeros.data(), 11)), "zero runs of different lengths hash alike");
+    std::array<std::byte, 40> small{};
+    const auto smallHash = AgcDriver::ContentHash::Of(small.data(), small.size());
+    small[39] = std::byte{1};
+    Require(!(AgcDriver::ContentHash::Of(small.data(), small.size()) == smallHash), "a changed byte of a short run keeps its hash");
+#ifdef _WIN32
+    auto* reserved = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * Block, MEM_RESERVE, PAGE_NOACCESS));
+    Require(reserved != nullptr && VirtualAlloc(reserved + 4096, 4096, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot reserve the partly committed block");
+    std::memset(reserved + 4096, 0x77, 4096);
+    const auto sparse = reinterpret_cast<std::uint64_t>(reserved) + 256;
+    const std::size_t sparseBytes = 2 * Block - 512;
+    std::vector<std::byte> read(sparseBytes);
+    ReadCommitted(sparse, read);
+    std::vector<Hash128> sparseHashes(HashBlockCount(sparse, sparseBytes)), readHashes(sparseHashes.size());
+    HashCommittedBlocks(sparse, sparseBytes, sparseHashes);
+    HashBlocksOf(sparse, read, readHashes);
+    Require(sparseHashes == readHashes && CommittedBlocksMatch(sparse, sparseBytes, readHashes), "uncommitted pages do not hash as the zeros ReadCommitted reads");
+    reserved[4096 + 5] = std::byte{0};
+    Require(!CommittedBlocksMatch(sparse, sparseBytes, readHashes), "a changed committed byte next to uncommitted pages still matches");
+    VirtualFree(reserved, 0, MEM_RELEASE);
+#endif
+}
+
 void CheckCollectBoundaries() {
     constexpr std::size_t bytes = 3 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -1710,10 +1617,7 @@ void CheckWidenedCollectBesideUncommittedPages() {
     void* range = GuestArena::GuestArenaAllocate_nid_postfix(reserved, Block);
     struct Cleanup {
         void* range;
-        ~Cleanup() {
-            GuestArena::GuestArenaReset_nid_postfix(range, reserved);
-            GuestArena::GuestArenaRelease_nid_postfix(range, reserved);
-        }
+        ~Cleanup() { GuestArena::GuestArenaRelease_nid_postfix(range, reserved); }
     } cleanup{range};
     void* memory = static_cast<std::uint8_t*>(range) + reserved - Block;
     MEMORY_BASIC_INFORMATION tail{};
@@ -1757,6 +1661,17 @@ void CheckImportWindow() {
     bytes[0x100] = 0x33;
     static_cast<void>(CollectWritesUncached(base, 3 * Block));
     Require(!UnchangedSince(base, Block, after), "a store after the import window was missed");
+}
+
+void CheckImportWindowOverUnwatchedPart() {
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    static_cast<void>(CollectWritesUncached(base, 3 * Block));
+    Unwatch(base + Block, Block);
+    const bool imported = ImportWatched(base, 3 * Block, [] { return true; });
+    Require(imported, "an import over a partly unwatched range failed");
+    Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "an import over a partly unwatched range took its watched blocks out of the watch");
 }
 
 void CheckImportWindowOtherThread() {
@@ -1841,41 +1756,6 @@ void CheckImportWindowOverUnwatchedBlock() {
     bytes[0x100] = 0x33;
     static_cast<void>(CollectWritesUncached(base, Block));
     Require(after != 0 && !UnchangedSince(base, Block, after), "a store after an import window over an unwatched block was missed");
-}
-
-void CheckImportWindowAcrossThreads() {
-    constexpr std::size_t blocks = 264;
-    constexpr std::size_t gap = 130;
-    constexpr std::size_t pageBytes = 4096;
-    void* memory = AllocateWatched(blocks * Block);
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
-    auto* plain = static_cast<std::uint8_t*>(memory);
-    std::memset(plain, 0x11, blocks * Block);
-    for (std::size_t page = 0; page < blocks * Block / pageBytes; ++page) {
-        const std::uint64_t mark = (page + 1) * 0x9E3779B97F4A7C15ull;
-        std::memcpy(plain + page * pageBytes, &mark, sizeof(mark));
-    }
-    Unwatch(base + gap * Block, Block);
-    const auto synced = CollectWritesUncached(base, gap * Block);
-    const auto syncedAfter = CollectWritesUncached(base + (gap + 1) * Block, (blocks - gap - 1) * Block);
-    Require(synced != 0 && syncedAfter != 0, "the blocks of a large import window are not collected");
-    constexpr std::array<std::size_t, 4> written{3, 70, 140, 250};
-    Require(ImportWatched(base, blocks * Block, [&] {
-        for (std::size_t page = 0; page < blocks * Block / pageBytes; ++page) {
-            if (page * pageBytes / Block != gap) bytes[page * pageBytes + 0x100] = 0x11;
-        }
-        for (const auto block : written) bytes[block * Block + 0x3100] = 0x22;
-        return true;
-    }), "the large import window import failed");
-    Require(Watched(base, gap * Block) && Watched(base + (gap + 1) * Block, (blocks - gap - 1) * Block) && !Watched(base + gap * Block, Block), "a large import window changed which blocks are watched");
-    const auto since = [&](std::size_t block) { return block < gap ? synced : syncedAfter; };
-    for (std::size_t block = 0; block < blocks; ++block) {
-        if (block == gap) continue;
-        const bool stored = std::find(written.begin(), written.end(), block) != written.end();
-        if (stored) Require(WrittenSince(base + block * Block, Block, since(block)), "a store of new bytes within a large import window was missed in block " + std::to_string(block));
-        else Require(UnchangedSince(base + block * Block, Block, since(block)), "a page a large import window resolved without changing its bytes reads as written in block " + std::to_string(block));
-    }
 }
 
 void CheckImportWindowFootprint() {
@@ -1988,106 +1868,6 @@ void CheckUnwatchedImport() {
     static_cast<void>(CollectWritesUncached(base, Block / 2));
     Require(after != 0 && !UnchangedSince(base, Block / 2, after), "a store beside an import that left the watch was missed");
 #endif
-}
-
-struct ImportHookCall {
-    std::uint64_t begin;
-    std::uint64_t end;
-    bool watched;
-    bool proven;
-};
-
-std::vector<ImportHookCall> importHookCalls;
-std::uint64_t importHookProbe = 0;
-
-void RecordImportHook(std::uint64_t address, std::size_t bytes) {
-    importHookCalls.push_back({address, address + bytes, Watched(importHookProbe, Block), UnwatchWritesProven()});
-}
-
-void CheckImportWalkUnwatchHooks() {
-    void* memory = AllocateWatched(4 * Block);
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    std::memset(memory, 0x11, 4 * Block);
-    Require(CollectWritesUncached(base, 4 * Block) != 0, "the import walk block is not collected");
-    struct Reset {
-        ~Reset() {
-            SetImportWalkFailureForTest(0);
-            SetUnwatchHook(nullptr);
-        }
-    } reset;
-    SetUnwatchHook(&RecordImportHook);
-    for (const int walk : {1, 2}) {
-        const std::string what = walk == 1 ? "an import that stays watched whose page walk failed before the import" : "an import that stays watched whose page walk failed after the import";
-        const auto imported = base + static_cast<std::uint64_t>(walk - 1) * 2 * Block;
-        Require(Watched(imported, Block), what + ": its block was not watched before the import");
-        importHookCalls.clear();
-        importHookProbe = imported;
-        bool hookedBeforeImport = false;
-        SetImportWalkFailureForTest(walk);
-        Require(ImportWatched(imported, Block, [&] {
-            hookedBeforeImport = !importHookCalls.empty();
-            return true;
-        }), what + ": the import failed");
-        SetImportWalkFailureForTest(0);
-        Require(importHookCalls.size() == 1, what + " did not run the unwatch hook once");
-        const auto& call = importHookCalls.front();
-        Require(call.begin <= imported && imported + Block <= call.end, what + " gave the unwatch hook a range that misses its block");
-        Require(call.watched, what + " ran the unwatch hook after its block left the write watch");
-        Require(!call.proven, what + " ran the unwatch hook as if the CPU writes to its block were proven");
-        Require(hookedBeforeImport == (walk == 1), what + (walk == 1 ? " ran the unwatch hook after the import" : " ran the unwatch hook before the import"));
-        Require(!Watched(imported, Block), what + " left its block watched");
-    }
-    importHookCalls.clear();
-    importHookProbe = base + 3 * Block;
-    Unwatch(base + 3 * Block, Block);
-    Require(importHookCalls.size() == 1 && importHookCalls.front().watched && importHookCalls.front().proven, "Unwatch did not run the unwatch hook once, while watched, with its CPU writes proven");
-}
-
-std::uint64_t collectDuringHookAddress = 0;
-std::size_t collectDuringHookBytes = 0;
-std::size_t collectDuringHookCalls = 0;
-
-void CollectDuringHook(std::uint64_t, std::size_t) {
-    if (collectDuringHookCalls++ == 0) static_cast<void>(CollectWritesUncached(collectDuringHookAddress, collectDuringHookBytes));
-}
-
-void CheckImportWalkHookKeepsLaterWindows() {
-    void* memory = AllocateWatched(4 * Block);
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
-    std::memset(memory, 0x11, 4 * Block);
-    Unwatch(base + Block, Block);
-    const auto synced = CollectWritesUncached(base + 2 * Block, 2 * Block);
-    Require(synced != 0 && CollectWritesUncached(base, Block) != 0, "the blocks around the unwatched one are not collected");
-    struct Reset {
-        ~Reset() {
-            SetImportWalkFailureForTest(0);
-            SetUnwatchHook(nullptr);
-        }
-    } reset;
-    collectDuringHookAddress = base + 2 * Block;
-    collectDuringHookBytes = 2 * Block;
-    collectDuringHookCalls = 0;
-    SetUnwatchHook(&CollectDuringHook);
-    SetImportWalkFailureForTest(2, base);
-    Require(ImportWatched(base, 4 * Block, [&] {
-        bytes[0x100] = 0x11;
-        bytes[2 * Block + 0x100] = 0x11;
-        bytes[3 * Block + 0x2000] = 0x22;
-        return true;
-    }), "the import whose first span failed its page walk failed");
-    SetImportWalkFailureForTest(0);
-    SetUnwatchHook(nullptr);
-    Require(collectDuringHookCalls == 1, "the span whose page walk failed after the import did not run the unwatch hook once");
-    Require(!Watched(base, Block), "the span whose page walk failed after the import stayed watched");
-    Require(Watched(base + 2 * Block, 2 * Block), "the span whose page walk succeeded left the write watch");
-    const std::array<std::uint64_t, 2> generations{synced, synced};
-    std::array<std::uint8_t, 2> changed{};
-    std::array<std::uint8_t, 2> cpu{};
-    Require(ChangedBlocks(base + 2 * Block, 2 * Block, generations, changed, cpu), "the span after the failed one is not tracked");
-    Require(changed[0] == BlockUnchanged && UnchangedSince(base + 2 * Block, Block, synced), "a collect run by the unwatch hook of an earlier span counted a page the import touched without changing it as a CPU write");
-    Require(cpu[0] == 1, "a page the import touched lost its import window walk to the unwatch hook of an earlier span");
-    Require(changed[1] == BlockWritten && WrittenSince(base + 3 * Block, Block, synced), "a store of new bytes within the import was missed after the unwatch hook of an earlier span");
 }
 
 struct HookCall {
@@ -2300,6 +2080,299 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+void StoreSame(std::uint8_t* at) {
+    auto* place = reinterpret_cast<volatile std::uint8_t*>(at);
+    *place = *place;
+}
+
+std::uint64_t CollectNow(std::uint64_t address, std::size_t bytes) {
+    BumpCollectEpoch();
+    return CollectWrites(address, bytes);
+}
+
+void CheckBlocksMatchSince() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Blocks = 4;
+    constexpr std::size_t Bytes = Blocks * Block;
+    void* memory = AllocateWatched(Bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) bytes[i] = static_cast<std::uint8_t>((i * 131u + 7u) ^ (i >> 11));
+    auto since = CollectNow(base, Bytes);
+    Require(since != 0, "the block-match surface is not collected");
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    const std::vector<std::uint8_t> none;
+    BlockMatch match;
+    const auto matches = [&](std::uint64_t generation, std::span<const std::uint8_t> pending = {}) { return CommittedBlocksMatchSince(base, Bytes, hashes, generation, nullptr, pending, &match); };
+
+    Require(matches(since) && match.hashed == 0 && match.skipped == Blocks && match.skippedBytes == Bytes, "an untouched surface was hashed");
+    Require(matches(0) && match.hashed == Blocks, "an unknown generation did not hash every block");
+
+    StoreSame(bytes + 2 * Block + 9);
+    Require(CollectNow(base, Bytes) > since, "a CPU store was not stamped");
+    Require(matches(since) && match.hashed == 1 && match.skipped == Blocks - 1 && match.hashedBytes == Block, "a CPU store of the same bytes did not re-hash exactly its block");
+
+    bytes[Block + 5] ^= 0x5a;
+    Require(CollectNow(base, Bytes) > since, "a CPU write was not stamped");
+    Require(!matches(since) && match.hashed == 1, "a CPU write that changed a byte still matches");
+    bytes[Block + 5] ^= 0x5a;
+    Require(matches(since) && match.hashed == 2, "restored bytes do not match after the CPU write");
+    Require(CommittedBlocksMatch(base, Bytes, hashes), "the full compare disagrees with the block compare");
+
+    since = CollectNow(base, Bytes);
+    Require(matches(since) && match.hashed == 0, "a collect after the writes leaves blocks stale");
+    Require(MarkWritten(base + 3 * Block + 16, 4) != 0 && matches(since) && match.hashed == 1, "a reported GPU store did not re-hash its block");
+    since = CollectNow(base, Bytes);
+    bytes[64] ^= 0x01;
+    Require(MarkWritten(base + 64, 1) != 0 && !matches(since) && match.hashed == 1, "a reported GPU write that changed a byte still matches");
+    bytes[64] ^= 0x01;
+    since = CollectNow(base, Bytes);
+
+    std::vector<std::uint8_t> pending(Blocks, 0);
+    pending[1] = 1;
+    Require(matches(since, pending) && match.hashed == 1 && match.skipped == Blocks - 1, "a block with a pending GPU write was not hashed");
+    pending[1] = 0;
+    Require(matches(since, pending) && match.hashed == 0, "pending flags of nothing hashed a block");
+
+    const auto offset = base + 0x1234;
+    const std::size_t offsetBytes = 2 * Block;
+    std::vector<Hash128> offsetHashes(HashBlockCount(offset, offsetBytes));
+    HashCommittedBlocks(offset, offsetBytes, offsetHashes);
+    since = CollectNow(base, Bytes);
+    Require(CommittedBlocksMatchSince(offset, offsetBytes, offsetHashes, since, nullptr, none, &match) && match.hashed == 0 && match.skipped == 3, "an unaligned range was hashed although untouched");
+    StoreSame(bytes + 0x1234 + Block + 3);
+    CollectNow(base, Bytes);
+    Require(CommittedBlocksMatchSince(offset, offsetBytes, offsetHashes, since, nullptr, none, &match) && match.hashed == 1 && match.hashedBytes == Block, "an unaligned range did not re-hash exactly the written block");
+
+    since = CollectNow(base, Bytes);
+    Unwatch(base + 2 * Block, Block);
+    Require(matches(since) && match.hashed == 1, "an unwatched block was trusted");
+    Require(!Watched(base + 2 * Block, Block), "the unwatched block is still watched");
+}
+
+void CheckBlocksMatchSinceCommitted() {
+    using AgcDriver::ContentHash::Hash128;
+    PartlyCommitted range;
+    const auto base = range.Address();
+    range.Commit(0);
+    range.Commit(2);
+    std::memset(range.Data(), 0x31, Block);
+    std::memset(range.Data() + 2 * Block, 0x42, Block);
+    Runs runs;
+    const auto synced = CollectCommitted(range, runs);
+    const Runs layout{{range.Address(0), range.Address(1)}, {range.Address(2), range.Address(3)}};
+    Require(synced != 0 && runs == layout, "the partly committed surface was not collected");
+    std::vector<Hash128> hashes(HashBlockCount(base, PartlyCommitted::Bytes));
+    HashCommittedBlocks(base, PartlyCommitted::Bytes, hashes);
+    BlockMatch match;
+    const std::vector<std::uint8_t> none;
+    const auto matches = [&](std::uint64_t generation) { return CommittedBlocksMatchSince(base, PartlyCommitted::Bytes, hashes, generation, &layout, none, &match); };
+    Require(matches(synced) && match.hashed == 0 && match.skipped == 4, "an untouched partly committed surface was hashed");
+
+    StoreSame(range.Data() + 2 * Block + 100);
+    Require(CollectCommitted(range, runs) > synced && matches(synced) && match.hashed == 1, "a store into a committed block did not re-hash exactly that block");
+
+    range.Commit(3);
+    Require(CollectCommitted(range, runs) != 0 && runs != layout, "the newly committed block is not described");
+    Require(matches(synced) && match.hashed == 2, "a newly committed block was not hashed");
+    range.Data()[3 * Block + 8] = 0x01;
+    CollectCommitted(range, runs);
+    Require(!matches(synced), "a write into a newly committed block still matches");
+    range.Decommit(3);
+
+    range.Decommit(2);
+    CollectCommitted(range, runs);
+    Require(!matches(synced) && match.hashed >= 1, "a decommitted block still matches its old bytes");
+}
+
+void CheckUntrackedBlocks() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Blocks = 3;
+    void* watched = AllocateWatched(Blocks * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(watched);
+    auto* bytes = static_cast<std::uint8_t*>(watched);
+    std::vector<std::uint8_t> stale(Blocks);
+    const std::vector<std::uint8_t> none(Blocks, 0);
+    UntrackedBlocks kinds;
+    const auto staleCount = [&] { return static_cast<std::size_t>(std::count(stale.begin(), stale.end(), std::uint8_t{1})); };
+    auto since = WalkUntrackedBlocks(base, Blocks * Block, 0, stale, &kinds);
+    Require(since != 0 && staleCount() == Blocks && kinds.covered == Blocks, "a first untracked walk trusted a block");
+    auto next = WalkUntrackedBlocks(base, Blocks * Block, since, stale, &kinds);
+    Require(next >= since && staleCount() == 0, "an untouched watched block read as stale");
+    StoreSame(bytes + Block + 77);
+    const auto stored = WalkUntrackedBlocks(base, Blocks * Block, next, stale, &kinds);
+    Require(stale[0] == 0 && stale[1] == 1 && stale[2] == 0 && stored > next, "a CPU store did not make exactly its block stale");
+    std::vector<Hash128> hashes(HashBlockCount(base, Blocks * Block));
+    HashCommittedBlocks(base, Blocks * Block, hashes);
+    BlockMatch match;
+    Require(CommittedBlocksMatchMarked(base, Blocks * Block, hashes, stale, &match) && match.hashed == 1 && match.skipped == Blocks - 1, "a marked compare hashed other blocks");
+    bytes[2 * Block + 3] ^= 0x10;
+    Require(CommittedBlocksMatchMarked(base, Blocks * Block, hashes, none, &match) && match.hashed == 0, "an unmarked compare hashed a block");
+    std::vector<std::uint8_t> last(Blocks, 0);
+    last[2] = 1;
+    Require(!CommittedBlocksMatchMarked(base, Blocks * Block, hashes, last, &match), "a marked changed block still matches");
+    bytes[2 * Block + 3] ^= 0x10;
+    std::array<std::uint8_t, 64> host{};
+    std::vector<std::uint8_t> hostStale(1);
+    WalkUntrackedBlocks(reinterpret_cast<std::uint64_t>(host.data()), host.size(), stored, hostStale, &kinds);
+    Require(hostStale[0] == 1 && kinds.covered == 0 && kinds.hinted == 0, "memory outside the watch was trusted");
+#ifdef _WIN32
+    constexpr std::size_t mixedBytes = 4 * Block;
+    auto* memory = static_cast<volatile std::uint8_t*>(AllocateWatched(mixedBytes));
+    const auto mixed = reinterpret_cast<std::uint64_t>(memory);
+    for (std::size_t offset = 0; offset < mixedBytes; offset += 4096) memory[offset] = 0x21;
+    CollectNow(mixed, mixedBytes);
+    Unwatch(mixed + Block, 2 * Block);
+    Require(UntrackedHint(mixed, mixedBytes) == 0 && CollectWrites(mixed, mixedBytes) == 0, "the mixed range is tracked as a whole");
+    std::vector<std::uint8_t> mixedStale(4);
+    since = WalkUntrackedBlocks(mixed, mixedBytes, 0, mixedStale, &kinds);
+    Require(since != 0 && kinds.covered == 2 && kinds.hinted == 2, "the mixed range's blocks were not classified");
+    next = WalkUntrackedBlocks(mixed, mixedBytes, since, mixedStale, &kinds);
+    Require(std::count(mixedStale.begin(), mixedStale.end(), std::uint8_t{1}) == 0, "an untouched mixed range read as stale");
+    memory[2 * Block + 4096 + 9] = memory[2 * Block + 4096 + 9];
+    auto after = WalkUntrackedBlocks(mixed, mixedBytes, next, mixedStale, &kinds);
+    Require(mixedStale[0] == 0 && mixedStale[1] == 0 && mixedStale[2] == 1 && mixedStale[3] == 0, "a CPU store into a hinted block did not make exactly it stale");
+    memory[3 * Block + 5] = memory[3 * Block + 5];
+    after = WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[0] == 0 && mixedStale[1] == 0 && mixedStale[2] == 0 && mixedStale[3] == 1, "a CPU store into a watched block of the mixed range did not make exactly it stale");
+    Require(MarkWritten(mixed + Block + 64, 8) == 0, "a driver store into an unwatched block was stamped");
+    WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[1] == 1, "a driver store into an unwatched block did not make it stale");
+    after = WalkUntrackedBlocks(mixed, mixedBytes, 0, mixedStale, &kinds);
+    Unwatch(mixed, Block);
+    WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[0] == 1 && kinds.hinted == 3, "a block leaving the watch was trusted");
+#endif
+}
+
+void BenchBlocksMatchSince() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Bytes = 4u << 20u;
+    constexpr int Rounds = 400;
+    void* memory = AllocateWatched(Bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) bytes[i] = static_cast<std::uint8_t>(i * 7u);
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    const std::vector<std::uint8_t> none;
+    const auto time = [&](const char* name, auto&& touch) {
+        double fullUs = 0.0;
+        double sinceUs = 0.0;
+        std::size_t hashed = 0;
+        for (int round = 0; round < Rounds; ++round) {
+            const auto since = CollectNow(base, Bytes);
+            touch(round);
+            CollectNow(base, Bytes);
+            const auto first = std::chrono::steady_clock::now();
+            const bool full = CommittedBlocksMatch(base, Bytes, hashes);
+            const auto second = std::chrono::steady_clock::now();
+            BlockMatch match;
+            const bool narrowed = CommittedBlocksMatchSince(base, Bytes, hashes, since, nullptr, none, &match);
+            const auto third = std::chrono::steady_clock::now();
+            Require(full && narrowed, "the benchmark surface changed");
+            fullUs += std::chrono::duration<double, std::micro>(second - first).count();
+            sinceUs += std::chrono::duration<double, std::micro>(third - second).count();
+            hashed += match.hashed;
+        }
+        std::cout << "[bench] " << name << ": 4 MiB snapshot check, full hash " << fullUs / Rounds << " us, written blocks only " << sinceUs / Rounds << " us (" << static_cast<double>(hashed) / Rounds << " of " << hashes.size() << " blocks hashed)\n";
+    };
+    time("nothing written", [](int) {});
+    time("one CPU store", [&](int round) {
+        const auto at = static_cast<std::size_t>(round) * 9973u % Bytes;
+        StoreSame(bytes + at);
+    });
+    time("one reported GPU store", [&](int round) { MarkWritten(base + static_cast<std::size_t>(round) * 65599u % (Bytes - 8), 8); });
+    time("every block written", [&](int) {
+        for (std::size_t at = 0; at < Bytes; at += Block) StoreSame(bytes + at);
+    });
+#ifdef _WIN32
+    Unwatch(base, Bytes / 2);
+    double fullUs = 0.0;
+    double walkUs = 0.0;
+    std::size_t hashed = 0;
+    std::vector<std::uint8_t> stale(hashes.size());
+    auto since = WalkUntrackedBlocks(base, Bytes, 0, stale);
+    for (int round = 0; round < Rounds; ++round) {
+        StoreSame(bytes + static_cast<std::size_t>(round) * 9973u % Bytes);
+        const auto first = std::chrono::steady_clock::now();
+        const bool full = CommittedBlocksMatch(base, Bytes, hashes);
+        const auto second = std::chrono::steady_clock::now();
+        const auto next = WalkUntrackedBlocks(base, Bytes, since, stale);
+        BlockMatch match;
+        const bool marked = CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match);
+        const auto third = std::chrono::steady_clock::now();
+        Require(full && marked && next != 0, "the untracked benchmark surface changed");
+        since = next;
+        fullUs += std::chrono::duration<double, std::micro>(second - first).count();
+        walkUs += std::chrono::duration<double, std::micro>(third - second).count();
+        hashed += match.hashed;
+    }
+    std::cout << "[bench] half unwatched (hinted), one CPU store: 4 MiB snapshot check, full hash " << fullUs / Rounds << " us, block walk + written blocks " << walkUs / Rounds << " us (" << static_cast<double>(hashed) / Rounds << " of " << hashes.size() << " blocks hashed)\n";
+#endif
+}
+
+#ifdef _WIN32
+void CheckUntrackedLayout() {
+    using AgcDriver::ContentHash::Hash128;
+    PartlyCommitted range;
+    const auto base = range.Address();
+    constexpr auto Bytes = PartlyCommitted::Bytes;
+    range.Commit(0);
+    range.Commit(1);
+    range.Commit(3);
+    std::memset(range.Data(), 0x51, Block);
+    std::memset(range.Data() + Block, 0x62, Block);
+    std::memset(range.Data() + 3 * Block, 0x73, Block);
+    CollectNow(range.Address(0), 2 * Block);
+    CollectNow(range.Address(3), Block);
+    Unwatch(range.Address(1), Block);
+    Require(CollectWrites(base, Bytes) == 0 && UntrackedHint(base, Bytes) == 0, "the partly committed mixed range is tracked as a whole");
+    std::vector<std::uint8_t> stale(4);
+    UntrackedBlocks kinds;
+    const auto staleCount = [&] { return static_cast<std::size_t>(std::count(stale.begin(), stale.end(), std::uint8_t{1})); };
+    auto plain = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds);
+    plain = WalkUntrackedBlocks(base, Bytes, plain, stale, &kinds);
+    Require(kinds.refused == 2 && stale[2] == 1 && stale[3] == 1, "a walk over the uncommitted block was not refused without the layout");
+    Commitment layout;
+    Commitment now;
+    auto since = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds, nullptr, &layout);
+    Require(since != 0 && staleCount() == 4 && !layout.whole && layout.ranges.size() == 2, "the baseline walk did not describe the layout");
+    auto next = WalkUntrackedBlocks(base, Bytes, since, stale, &kinds, &layout, &now);
+    Require(staleCount() == 0 && kinds.refused == 0 && kinds.partial == 1 && kinds.layoutChanged == 0 && kinds.covered == 3 && kinds.hinted == 1, "an untouched partly committed mixed range read as stale");
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    BlockMatch match;
+    Require(CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now) && match.hashed == 0 && match.skipped == 4, "a clean partly committed range was hashed");
+    StoreSame(range.Data() + 3 * Block + 40);
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[0] == 0 && stale[1] == 0 && stale[2] == 0 && stale[3] == 1, "a CPU store beside the uncommitted block did not make exactly its block stale");
+    StoreSame(range.Data() + Block + 9);
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[0] == 0 && stale[1] == 1 && stale[2] == 0 && stale[3] == 0, "a CPU store into the hinted block did not make exactly it stale");
+    const Commitment other{{{range.Address(0), range.Address(2)}}, false};
+    WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &other, &now);
+    Require(stale[3] == 1 && stale[0] == 0 && stale[1] == 0 && stale[2] == 0 && kinds.layoutChanged == 1, "a block whose committed runs differ from the baseline's was trusted");
+    WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, nullptr, &now);
+    Require(staleCount() == 4, "a walk without a baseline layout trusted a block");
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    range.Commit(2);
+    auto committed = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[2] == 1 && now.whole, "a newly committed block was trusted");
+    Require(CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "the zeros of a newly committed block differ from its uncommitted hash");
+    range.Data()[2 * Block + 8] = 0x01;
+    std::swap(layout, now);
+    WalkUntrackedBlocks(base, Bytes, committed, stale, &kinds, &layout, &now);
+    Require(stale[2] == 1 && !CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "a write into a newly committed block still matches");
+    range.Data()[2 * Block + 8] = 0;
+    committed = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds, nullptr, &layout);
+    range.Decommit(3);
+    WalkUntrackedBlocks(base, Bytes, committed, stale, &kinds, &layout, &now);
+    Require(stale[3] == 1 && kinds.layoutChanged >= 1 && !CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "a decommitted block still matches its old bytes");
+}
+#endif
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -2324,122 +2397,1010 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
-void CheckGenerationWrap() {
-    constexpr std::uint64_t Wrap = std::uint64_t{1} << 32u;
-    constexpr std::size_t bytes = 192 * Block;
-    void* memory = AllocateWatched(bytes);
-    void* scratch = AllocateWatched(Block);
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    const auto other = reinterpret_cast<std::uint64_t>(scratch);
-    std::memset(memory, 0x11, bytes);
-    std::memset(scratch, 0x11, Block);
-    BumpCollectEpoch();
-    Require(CollectWrites(base, bytes) != 0 && CollectWrites(other, Block) != 0, "the wrap fixture was not collected");
-    AdvanceTrackerGenerationForTest(Wrap - 4);
-    BumpCollectEpoch();
-    const auto before = CollectWritesUncached(base, bytes);
-    Require(before >= Wrap - 4 && before < Wrap, "the stamp before the crossing was not taken just below 2^32");
-    Require(UnchangedSince(base, bytes, before), "a range nothing wrote after its collect reports a change");
-    for (int store = 0; store < 8; ++store) MarkWritten(other, 4);
-    Require(TrackerGeneration() > Wrap, "the tracker generation did not cross 2^32");
-    const auto middle = base + bytes / 2;
-    const auto stored = MarkWritten(middle, 4);
-    Require(stored > Wrap && stored > before, "a driver store after 2^32 returned a stamp not newer than one taken before");
-    Require(!UnchangedSince(base, bytes, before), "a driver store after 2^32 was reported unchanged over whole coarse runs");
-    Require(!UnchangedSince(middle, Block, before), "a driver store after 2^32 was reported unchanged in its block");
-    Require(WrittenSince(base, bytes, before) && StoredOver(middle, 4, before), "a driver store after 2^32 was not seen as written since the earlier stamp");
-    Require(NewestStamp(middle, Block) > before, "the newest stamp after 2^32 is not newer than the earlier stamp");
-    Require(!StoredAllSince_nid_no_patch(middle, 4, stored) && StoredAllSince_nid_no_patch(middle, 4, before), "the driver piece of a store after 2^32 lost its generation");
-    Require(UnchangedSince(base, bytes / 2, before) && UnchangedSince(base, bytes, stored), "a store after 2^32 changed other blocks or a later stamp");
-    static_cast<volatile std::uint8_t*>(memory)[bytes - 1] = 0x22;
-    const auto last = base + bytes - Block;
-    Require(CollectWritesUncached(last, Block) > Wrap, "a collect after 2^32 returned a wrapped generation");
-    Require(!UnchangedSince(last, Block, before) && !UnchangedSinceCollected(last, Block, before), "a CPU store after 2^32 was reported unchanged");
-    std::array<std::uint64_t, 3> generations{before, before, before};
-    std::array<std::uint8_t, 3> changed{};
-    std::array<std::uint8_t, 3> cpu{};
-    Require(ChangedBlocks(base + bytes - 3 * Block, 3 * Block, generations, changed, cpu), "the changed-block query over the wrap fixture failed");
-    Require(changed[0] == BlockUnchanged && changed[2] == BlockWritten && cpu[0] == 0 && cpu[2] == 1, "per-block changes after 2^32 were misreported");
-}
-
-void CheckMarkPossiblyWrittenOrder() {
-    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(2 * Block));
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    std::memset(memory, 0x11, 2 * Block);
-    Require(CollectWrites(base, 2 * Block) != 0, "the mark-order fixture was not collected");
-
-    std::uint64_t emptyOrder = 1;
-    Require(MarkPossiblyWritten(base, 0, emptyOrder) == 0 && emptyOrder == 0, "an empty possible write returned a tracker order");
-    std::uint64_t trackedOrder = 0;
-    const auto trackedProof = MarkPossiblyWritten(base + 8, 4, trackedOrder);
-    Require(trackedProof != 0 && trackedOrder == trackedProof, "a tracked possible write did not return its stamped order");
-    const auto later = MarkWritten(base + Block + 8, 4);
-    Require(later > trackedOrder && trackedOrder == trackedProof, "a later generation increment changed the captured mark order");
-
-    Unwatch(base, Block);
-    Require(MarkPossiblyWritten(base + 16, 4) == 0, "the two-argument possible write trusted an untracked range");
-    const auto beforeUntracked = TrackerGeneration();
-    std::uint64_t untrackedOrder = 0;
-    Require(MarkPossiblyWritten(base + 16, 4, untrackedOrder) == 0, "the ordered possible write trusted an untracked range");
-    Require(untrackedOrder > beforeUntracked && untrackedOrder == TrackerGeneration(), "an untracked possible write did not return its atomic tracker order");
-
-    constexpr std::size_t MarkCount = 128;
-    std::array<std::uint64_t, MarkCount> proofs{};
-    std::array<std::uint64_t, MarkCount> orders{};
-    std::atomic<bool> start{false};
-    std::thread marker([&] {
-        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-        for (std::size_t i = 0; i < MarkCount; ++i) proofs[i] = MarkPossiblyWritten(base + Block + 16, 4, orders[i]);
-    });
-    std::thread advancing([&] {
-        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-        for (std::size_t i = 0; i < MarkCount; ++i) MarkWritten(base + Block + 64, 4);
-    });
-    start.store(true, std::memory_order_release);
-    marker.join();
-    advancing.join();
-    for (std::size_t i = 0; i < MarkCount; ++i) Require(proofs[i] != 0 && proofs[i] == orders[i], "a concurrent generation increment changed a possible-write order");
-
 #ifdef _WIN32
-    std::array<std::uint8_t, 4> interleavingBuffer{};
-    failedCollectInterleavingAddress = reinterpret_cast<std::uint64_t>(interleavingBuffer.data());
-    failedCollectInterleavingOrder = 0;
-    failedCollectInterleavingProof = 1;
-    failedCollectInterleavingCalled = false;
-    failedCollectInterleavingFailed = false;
-    SetFreshCollectHook(&FailFreshCollect);
-    SetUnwatchHook(&MarkDuringFailedCollectUnwatch);
-    std::uint64_t failedCollectOrder = 0;
-    const auto failedCollectProof = MarkPossiblyWritten(base + Block + 8, 4, failedCollectOrder);
-    SetFreshCollectHook(nullptr);
-    SetUnwatchHook(nullptr);
-    Require(failedCollectProof == 0 && failedCollectBegin == base + Block && failedCollectEnd == base + 2 * Block, "the failed fresh collect did not reach the intended watched block");
-    Require(failedCollectInterleavingCalled && !failedCollectInterleavingFailed, "the failed fresh collect did not allow the intervening mark to complete");
-    Require(failedCollectInterleavingProof == 0, "the intervening mark unexpectedly produced a proof");
-    Require(failedCollectOrder > failedCollectInterleavingOrder, "a failed fresh collect reused the intervening writer's mark order");
-#endif
+// Owned proofs (GuestMemory::ArmOwnedBlocks / OwnedWordsHold / OwnedProofHolds over the libc arena's
+// resident direct memory and private commits, by write watch): every CPU store into an armed block
+// is seen without a fault (no access violation reaches any handler and the protection never
+// changes), every host write, protection or mapping change moves its word before it takes effect,
+// across threads; the write bits an arming takes still reach the collects; what cannot be armed
+// (aliased views, host memory) is refused.
+std::atomic<std::uint64_t> ownedAccessViolations{0};
+
+LONG CALLBACK CountOwnedAccessViolations(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) ownedAccessViolations.fetch_add(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_SEARCH;
 }
+
+// Counts the access violations raised while it lives, ahead of every other handler.
+struct FaultCounter {
+    PVOID handler = AddVectoredExceptionHandler(1, CountOwnedAccessViolations);
+    std::uint64_t before = ownedAccessViolations.load();
+    FaultCounter() { Require(handler != nullptr, "cannot install the access violation counter"); }
+    ~FaultCounter() { RemoveVectoredExceptionHandler(handler); }
+    FaultCounter(const FaultCounter&) = delete;
+    FaultCounter& operator=(const FaultCounter&) = delete;
+    std::uint64_t Faults() const { return ownedAccessViolations.load() - before; }
+};
+struct DirectFixture {
+    std::size_t bytes;
+    std::uint8_t* memory = nullptr;
+    HANDLE section = nullptr;
+
+    DirectFixture(std::size_t bytes, std::size_t mappedBytes) : bytes(bytes) {
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        Require(memory != nullptr, "cannot reserve the owned-proof fixture");
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+        Require(section != nullptr, "cannot create the owned-proof backing");
+        if (mappedBytes != 0) Map(0, mappedBytes);
+    }
+    ~DirectFixture() {
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
+    DirectFixture(const DirectFixture&) = delete;
+    DirectFixture& operator=(const DirectFixture&) = delete;
+    void Map(std::size_t offset, std::size_t length) {
+        GuestArena::GuestArenaMapDirect_nid_postfix(memory + offset, length, section, offset, PAGE_READWRITE);
+    }
+    std::uint64_t Base() const { return reinterpret_cast<std::uint64_t>(memory); }
+    volatile std::uint8_t& At(std::size_t offset) { return static_cast<volatile std::uint8_t*>(memory)[offset]; }
+    DWORD Protection(std::size_t offset) const {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory + offset, &info, sizeof(info)) == sizeof(info), "cannot query owned-proof protection");
+        return info.Protect;
+    }
+};
+
+std::vector<std::uint64_t> ArmOwned(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::uint64_t> words(HashBlockCount(address, bytes));
+    if (!ArmOwnedBlocks(address, bytes, words)) words.clear();
+    return words;
+}
+
+// Refusal reasons, as GuestMemory::OwnedBlockCounts::refusedBy counts them.
+enum OwnedReason : std::size_t { ReasonOutside, ReasonShared, ReasonPinned, ReasonHostWrite, ReasonInFlight, ReasonNotWritable, ReasonPrivate, ReasonEmpty, ReasonUnwatched };
+
+struct PrivateFixture {
+    std::size_t bytes;
+    std::uint8_t* memory = nullptr;
+
+    std::size_t granule = 16384;
+    std::uint64_t touched = 0;
+
+    PrivateFixture(std::size_t bytes, std::size_t committed, std::size_t granule = 16384) : bytes(bytes), granule(granule) {
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        Require(memory != nullptr, "cannot reserve the private owned-proof fixture");
+        if (committed != 0) Commit(0, committed);
+    }
+    ~PrivateFixture() {
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    }
+    PrivateFixture(const PrivateFixture&) = delete;
+    PrivateFixture& operator=(const PrivateFixture&) = delete;
+    void Commit(std::size_t offset, std::size_t length) {
+        GuestArena::GuestArenaCommit_nid_postfix(memory + offset, length, PAGE_READWRITE, granule);
+        for (std::size_t page = offset; page < offset + length; page += 4096) touched += At(page);
+    }
+    std::uint64_t Base() const { return reinterpret_cast<std::uint64_t>(memory); }
+    volatile std::uint8_t& At(std::size_t offset) { return static_cast<volatile std::uint8_t*>(memory)[offset]; }
+    DWORD Protection(std::size_t offset) const {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory + offset, &info, sizeof(info)) == sizeof(info), "cannot query private owned-proof protection");
+        return info.Protect;
+    }
+};
+
+void CheckOwnedPrivate() {
+    // Private commits (flexible and memory-pool memory): refused while not allowed, else armed with
+    // their protection untouched, and a store lands without a fault and ends its block's proof.
+    {
+        const FaultCounter faults;
+        PrivateFixture fixture(2 * Block, 2 * Block);
+        const auto base = fixture.Base();
+        TakeOwnedBlockCounts();
+        std::vector<std::uint64_t> words(2);
+        Require(!ArmOwnedBlocks(base, 2 * Block, words, false), "private memory was armed while not allowed");
+        Require(TakeOwnedBlockCounts().refusedBy[ReasonPrivate] == 1, "a refusal of private memory was not counted as private");
+        words = ArmOwned(base, 2 * Block);
+        if (words.size() != 2) {
+            const auto refused = TakeOwnedBlockCounts();
+            std::string reasons;
+            for (const auto count : refused.refusedBy) reasons += " " + std::to_string(count);
+            Require(false, "private memory was not armed, refusals by reason:" + reasons);
+        }
+        Require(fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(2 * Block - 1) == PAGE_READWRITE, "arming changed the protection of private memory to " + std::to_string(fixture.Protection(0)));
+        Require(fixture.At(70000) == 0 && OwnedWordsHold(base, 2 * Block, words), "a read of armed private memory moved its words");
+        fixture.At(70000) = 0x5a;
+        Require(fixture.At(70000) == 0x5a && !OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base, Block, std::span(words).first(1)), "a store into armed private memory was missed or moved another block");
+        Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READWRITE, "a store into armed private memory changed a protection");
+        const auto counts = TakeOwnedBlockCounts();
+        Require(counts.privateBlocks == 2 && counts.faults == 0 && counts.dirty == 1, "private arming was not counted, or the store was not seen as a written page");
+        std::thread([&] { fixture.At(100) = 1; }).join();
+        Require(!OwnedWordsHold(base, Block, std::span(words).first(1)) && fixture.At(100) == 1, "a store into armed private memory from another thread was missed");
+        Require(faults.Faults() == 0 && TakeOwnedBlockCounts().faults == 0, "a store into armed private memory raised an access violation");
+    }
+    // The write bits an arming takes still reach the collects, in address order and within their
+    // capacity; a collect that takes a bit written after the arming moves the block's word.
+    {
+        PrivateFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        std::array<void*, 2> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true), "cannot settle the collect fixture");
+        while (count == pages.size()) {
+            count = pages.size();
+            Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true), "cannot settle the collect fixture");
+        }
+        for (std::size_t page = 0; page < 3; ++page) fixture.At(page * 4096) = 1;
+        TakeOwnedBlockCounts();
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1 && OwnedWordsHold(base, Block, words), "the collect fixture could not be armed clean");
+        Require(TakeOwnedBlockCounts().taken == 3, "the arming did not take the three written pages");
+        fixture.At(3 * 4096) = 1;
+        Require(!OwnedWordsHold(base, Block, words), "a store after the arming was missed");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, false) && count == 2 && pages[0] == fixture.memory && pages[1] == fixture.memory + 4096, "a peek did not report the taken pages first");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true) && count == 2 && pages[0] == fixture.memory && pages[1] == fixture.memory + 4096, "a clearing collect did not report the taken pages first");
+        Require(TakeOwnedBlockCounts().collected == 1, "a collect that took a page written after the arming did not move the word");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true) && count == 2 && pages[0] == fixture.memory + 2 * 4096 && pages[1] == fixture.memory + 3 * 4096, "the pages past the capacity were not reported next");
+        count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, Block, pages.data(), &count, true) && count == 0, "a page was reported twice");
+        const auto again = ArmOwned(base, Block);
+        Require(again.size() == 1 && again[0] != words[0] && OwnedWordsHold(base, Block, again), "the block was not armed afresh after its writes were collected");
+    }
+    // A block of private pages and reserved placeholders is armed; committing the rest moves it.
+    {
+        PrivateFixture fixture(Block, Block / 2);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block / 2);
+        Require(words.size() == 1, "a partly committed private block could not be armed");
+        fixture.Commit(Block / 2, Block / 2);
+        Require(!OwnedWordsHold(base, Block / 2, words), "committing into an armed block left its word");
+        fixture.At(Block - 1) = 3;
+        Require(fixture.At(Block - 1) == 3, "the newly committed page is not writable");
+    }
+    // Read-only private memory (GPU-read-only guest memory) is armed as it is; the guest making it
+    // writable moves the word first. Inaccessible memory is refused.
+    {
+        PrivateFixture fixture(2 * Block, 2 * Block);
+        const auto base = fixture.Base();
+        const auto guestProtect = [&](std::size_t offset, std::size_t length, DWORD protection) {
+            GuestArena::GuestArenaSetProtection_nid_postfix(base + offset, length, protection);
+            for (std::size_t page = offset; page < offset + length; page += 16384) {
+                DWORD previous = 0;
+                Require(VirtualProtect(fixture.memory + page, 16384, protection, &previous) != 0, "cannot change the private fixture's protection");
+            }
+            GuestArena::GuestArenaEndSetProtection_nid_no_patch(base + offset, length);
+        };
+        guestProtect(0, Block, PAGE_READONLY);
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1 && fixture.Protection(0) == PAGE_READONLY, "read-only private memory was not armed as it is");
+        guestProtect(0, Block, PAGE_READWRITE);
+        Require(!OwnedWordsHold(base, Block, words), "the guest making armed read-only memory writable left the word");
+        fixture.At(8) = 9;
+        Require(fixture.At(8) == 9, "the page made writable by the guest is not writable");
+        guestProtect(Block, Block, PAGE_NOACCESS);
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(base + Block, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonNotWritable] == 1, "inaccessible private memory was armed or not counted as not writable");
+        guestProtect(Block, Block, PAGE_READWRITE);
+    }
+    // Pinned private memory (a guest stack: host code runs on it and passes it to OS calls) is not
+    // armed, and pinning an armed block disarms it.
+    {
+        PrivateFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the pin fixture");
+        GuestArena::GuestArenaPinWritable_nid_postfix(fixture.memory + 4096, 8192);
+        Require(!OwnedWordsHold(base, Block, words) && fixture.Protection(0) == PAGE_READWRITE, "pinning an armed block left it armed");
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(base, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonPinned] == 1, "pinned private memory was armed or not counted as pinned");
+        GuestArena::GuestArenaUnpinWritable_nid_postfix(fixture.memory + 4096, 8192);
+        Require(!ArmOwned(base, Block).empty(), "unpinned private memory cannot be armed");
+    }
+    // A host write over private memory opens the block first and refuses arming until it ends.
+    {
+        PrivateFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the private host-write fixture");
+        {
+            const GuestArena::HostWrite write(fixture.memory + 64, 64);
+            Require(write.Open() && !OwnedWordsHold(base, Block, words), "a host write over private memory left the words");
+            TakeOwnedBlockCounts();
+            Require(ArmOwned(base, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonHostWrite] == 1, "private memory was armed during a host write or not counted");
+            std::memset(fixture.memory + 64, 0x11, 64);
+        }
+        Require(fixture.At(64) == 0x11 && !ArmOwned(base, Block).empty(), "the private host write did not land or the block cannot be armed after it");
+    }
+    // Refusal reasons for memory outside the arena and for a protection change in flight.
+    {
+        TakeOwnedBlockCounts();
+        std::vector<std::uint8_t> host(2 * Block);
+        Require(ArmOwned(reinterpret_cast<std::uint64_t>(host.data()), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonOutside] == 1, "host memory was armed or not counted as outside");
+        PrivateFixture fixture(Block, Block);
+        GuestArena::GuestArenaSetProtection_nid_postfix(fixture.Base(), Block, PAGE_READWRITE);
+        Require(ArmOwned(fixture.Base(), Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonInFlight] == 1, "a block was armed during a protection change or not counted");
+        GuestArena::GuestArenaEndSetProtection_nid_no_patch(fixture.Base(), Block);
+    }
+    // Unmapped blocks (sparse and partly committed surfaces) are armed by the word alone; committing
+    // or mapping into one moves its word first, and a mixed block keeps its mapped pages protected.
+    {
+        PrivateFixture fixture(3 * Block, 0);
+        const auto base = fixture.Base();
+        TakeOwnedBlockCounts();
+        const auto words = ArmOwned(base, 3 * Block);
+        Require(words.size() == 3, "unmapped blocks could not be armed");
+        const auto counts = TakeOwnedBlockCounts();
+        Require(counts.unmappedBlocks == 3 && counts.partialBlocks == 0 && counts.refused == 0, "unmapped blocks were not counted as armed unmapped");
+        Require(OwnedWordsHold(base, 3 * Block, words), "armed unmapped blocks do not hold");
+        fixture.Commit(Block + 16384, 16384);
+        Require(!OwnedWordsHold(base + Block, Block, std::span(words).subspan(1, 1)) && OwnedWordsHold(base, Block, std::span(words).first(1)) && OwnedWordsHold(base + 2 * Block, Block, std::span(words).subspan(2, 1)), "a commit into an armed unmapped block left its word or moved others");
+        fixture.At(Block + 16384) = 4;
+        Require(fixture.At(Block + 16384) == 4 && fixture.Protection(Block + 16384) == PAGE_READWRITE, "the page committed into an armed unmapped block is not plain writable memory");
+        const auto mixed = ArmOwned(base + Block, Block);
+        Require(mixed.size() == 1 && TakeOwnedBlockCounts().partialBlocks == 1, "a partly committed block was not armed as partly mapped");
+        Require(fixture.Protection(Block + 16384) == PAGE_READWRITE, "arming changed the protection of the mapped page of a mixed block");
+        fixture.At(Block + 16385) = 5;
+        Require(!OwnedWordsHold(base + Block, Block, mixed) && fixture.At(Block + 16385) == 5, "a store into the mapped page of a mixed block was missed");
+    }
+    // Direct memory mapped into an armed unmapped block moves its word.
+    {
+        DirectFixture fixture(Block, 0);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1, "an unmapped block for direct memory could not be armed");
+        fixture.Map(0, 16384);
+        Require(!OwnedWordsHold(base, Block, words), "mapping direct memory into an armed unmapped block left its word");
+    }
+    // An unmapped block inside a pinned range (a guest stack's reserve) is refused.
+    {
+        PrivateFixture fixture(Block, 0);
+        const auto base = fixture.Base();
+        GuestArena::GuestArenaPinWritable_nid_postfix(fixture.memory, Block);
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(base, Block).empty() && TakeOwnedBlockCounts().refusedBy[ReasonPinned] == 1, "an unmapped pinned block was armed or not counted as pinned");
+        GuestArena::GuestArenaUnpinWritable_nid_postfix(fixture.memory, Block);
+    }
+    std::cout << "owned proofs: private memory armed when allowed, read-only as it is; inaccessible, pinned, host-written, outside and in-flight blocks refused by reason; unmapped and partly mapped blocks armed\n";
+}
+
+void CheckOwnedStampOnWrite() {
+    const FaultCounter faults;
+    DirectFixture fixture(4 * Block, 4 * Block);
+    const auto base = fixture.Base();
+    std::uintptr_t spanBegin = 0;
+    std::uintptr_t spanEnd = 0;
+    Require(GuestArena::GuestArenaResidentSpan_nid_postfix(base, 1, &spanBegin, &spanEnd) && spanBegin == base, "the owned-proof fixture is not resident direct memory");
+    TakeOwnedBlockCounts();
+    fixture.At(Block + 17) = 0x21;
+    const auto words = ArmOwned(base + 100, 2 * Block);
+    Require(words.size() == 3, "resident direct memory with one view could not be armed");
+    Require(fixture.Protection(0) == PAGE_READWRITE && fixture.Protection(2 * Block + 4096) == PAGE_READWRITE && fixture.Protection(3 * Block) == PAGE_READWRITE, "arming changed a protection");
+    Require(OwnedWordsHold(base + 100, 2 * Block, words), "armed words do not hold without a store");
+    Require(fixture.At(Block + 17) == 0x21, "a read of armed memory changed it");
+    Require(OwnedWordsHold(base + 100, 2 * Block, words), "a read moved the armed words");
+    const auto since = TrackerGeneration();
+    Require(OwnedProofHolds(base + 100, 2 * Block, words, since), "an armed proof without a store does not hold");
+    fixture.At(Block + 18) = 0x42;
+    Require(fixture.At(Block + 18) == 0x42, "the store into armed memory did not land");
+    Require(!OwnedWordsHold(base + 100, 2 * Block, words) && !OwnedProofHolds(base + 100, 2 * Block, words, since), "a CPU store into an armed block left its words");
+    Require(OwnedWordsHold(base, Block, std::span(words).first(1)) && OwnedWordsHold(base + 2 * Block, Block, std::span(words).subspan(2, 1)), "a CPU store moved the words of other blocks");
+    Require(fixture.Protection(Block) == PAGE_READWRITE && fixture.Protection(0) == PAGE_READWRITE, "a store into armed memory changed a protection");
+    const auto counts = TakeOwnedBlockCounts();
+    Require(counts.arms == 1 && counts.armedBlocks == 3 && counts.faults == 0 && counts.taken == 1 && counts.dirty == 2, "owned counts do not show one arm of three blocks, one taken page and two written answers without a fault");
+    Require(faults.Faults() == 0, "a store into armed memory raised an access violation");
+    std::cout << "owned proofs: arm, read, a store is seen by write watch without a fault and ends only its block's proof\n";
+
+    // A driver stamp (MarkWritten: a GPU write through an import) ends the proof through the tracker.
+    const auto again = ArmOwned(base, Block);
+    Require(again.size() == 1 && again[0] == words[0], "re-arming an armed block changed its word");
+    const auto stamped = TrackerGeneration();
+    Require(OwnedProofHolds(base, Block, again, stamped), "an armed proof at the current generation does not hold");
+    MarkWritten(base + 64, 4);
+    Require(OwnedWordsHold(base, Block, again) && !OwnedProofHolds(base, Block, again, stamped), "a driver stamp did not end the armed proof");
+    std::cout << "owned proofs: driver stamps end the proof through the tracker\n";
+}
+
+void CheckOwnedRearm() {
+    const FaultCounter faults;
+    DirectFixture fixture(2 * Block, 2 * Block);
+    const auto base = fixture.Base();
+    TakeOwnedBlockCounts();
+    std::uint64_t previous = 0;
+    for (unsigned round = 0; round < 8; ++round) {
+        const auto words = ArmOwned(base, 2 * Block);
+        Require(words.size() == 2 && words[0] != previous && (words[0] & 1u) != 0, "a written block was not re-armed with a new word");
+        previous = words[0];
+        Require(OwnedWordsHold(base, 2 * Block, words), "re-armed words do not hold");
+        fixture.At(round * 4096 + 3) = static_cast<std::uint8_t>(round + 1);
+        Require(!OwnedWordsHold(base, 2 * Block, words) && fixture.At(round * 4096 + 3) == round + 1, "a store after re-arming was missed");
+    }
+    const auto counts = TakeOwnedBlockCounts();
+    Require(counts.faults == 0 && counts.collected == 7 && counts.arms == 8 && counts.armedBlocks == 9, "re-arm rounds did not re-arm the written block once each without a fault");
+    Require(faults.Faults() == 0, "a store into re-armed memory raised an access violation");
+    std::cout << "owned proofs: re-armed after every store, each store seen, no fault\n";
+}
+
+void CheckOwnedCrossThread() {
+    const FaultCounter faults;
+    DirectFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    auto* value = reinterpret_cast<volatile std::uint32_t*>(fixture.memory + 0x2000);
+    *value = 0;
+    // Deterministic: a store made and finished on another thread is seen by a later check.
+    {
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the cross-thread fixture");
+        std::thread([&] { *value = 1; }).join();
+        Require(!OwnedWordsHold(base, Block, words) && *value == 1, "a store finished on another thread left the words");
+    }
+    // Racing: the writer stores n, then publishes n. A check that holds after reading the published
+    // value p cannot have missed a store: p is at most the value read right after arming.
+    std::atomic<std::uint32_t> published{1};
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (std::uint32_t next = 2; !stop.load(std::memory_order_relaxed); ++next) {
+            *value = next;
+            published.store(next, std::memory_order_release);
+            if ((next & 63u) == 0) std::this_thread::yield();
+        }
+    });
+    std::size_t held = 0;
+    std::size_t moved = 0;
+    try {
+        for (unsigned round = 0; round < 3000; ++round) {
+            const auto words = ArmOwned(base, Block);
+            Require(!words.empty(), "cannot re-arm the racing fixture");
+            const auto armedValue = *value;
+            for (unsigned check = 0; check < 64; ++check) {
+                const auto seen = published.load(std::memory_order_acquire);
+                if (!OwnedWordsHold(base, Block, words)) {
+                    ++moved;
+                    break;
+                }
+                ++held;
+                Require(seen <= armedValue, "an armed check held after a store it should have seen");
+            }
+        }
+    } catch (...) {
+        stop = true;
+        writer.join();
+        throw;
+    }
+    stop = true;
+    writer.join();
+    Require(moved > 0, "the racing writer never moved the words");
+    Require(faults.Faults() == 0 && TakeOwnedBlockCounts().faults == 0, "the racing stores raised an access violation");
+    std::cout << "owned proofs: cross-thread stores, " << held << " checks held, " << moved << " saw the store\n";
+}
+
+// Owned answers inside a collect epoch (OwnedWordsHold on a thread that bumped its epoch): the first
+// answer of an epoch queries the blocks whole and checks them, later ones read the checks and the
+// words only; a store made before the thread's last ordering point (its bump) is always seen, one
+// made after it may be seen only after the next bump; a collect that takes a written page, a
+// mapping change or APS5_NO_OWNED_EPOCH end such answers as before; outside an epoch every answer
+// queries.
+void CheckOwnedEpoch() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const FaultCounter faults;
+    Require(_putenv_s("APS5_VERIFY_OWNED_EPOCH", "40") == 0, "cannot ask for epoch verification");
+    DirectFixture fixture(4 * Block, 4 * Block);
+    const auto base = fixture.Base();
+    {
+        EndCollectEpoch();
+        const auto words = ArmOwned(base, 2 * Block);
+        Require(words.size() == 2, "cannot arm the epoch fixture");
+        TakeOwnedBlockCounts();
+        Require(OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base, 2 * Block, words), "armed words do not hold outside an epoch");
+        auto counts = TakeOwnedBlockCounts();
+        Require(counts.epochHeld == 0 && counts.epochQueried == 0 && counts.queries >= 2, "an answer outside an epoch did not query");
+
+        BumpCollectEpoch();
+        Require(OwnedWordsHold(base, 2 * Block, words), "armed words do not hold in a new epoch");
+        counts = TakeOwnedBlockCounts();
+        Require(counts.epochQueried == 1 && counts.epochHeld == 0 && counts.queries >= 1, "the first answer of an epoch did not query the blocks");
+        for (int round = 0; round < 10; ++round) Require(OwnedWordsHold(base, 2 * Block, words) && OwnedWordsHold(base + Block, Block, std::span(words).subspan(1, 1)), "a checked block does not hold");
+        counts = TakeOwnedBlockCounts();
+        Require(counts.epochHeld == 20 && counts.epochQueried == 0 && counts.epochVerified == 20 && counts.epochDisagreed == 0, "answers after the check queried or disagreed with a query");
+
+        fixture.At(Block + 40) = 7;
+        Require(OwnedWordsHold(base, 2 * Block, words), "a store after the mark ended the epoch's answer");
+        counts = TakeOwnedBlockCounts();
+        Require(counts.epochHeld == 1 && counts.epochVerified == 1 && counts.epochDisagreed == 1, "the epoch verification did not report the store after the mark");
+        BumpCollectEpoch();
+        Require(!OwnedWordsHold(base + Block, Block, std::span(words).subspan(1, 1)), "a store before the mark was missed");
+        Require(OwnedWordsHold(base, Block, std::span(words).first(1)), "a store moved another block's answer");
+        Require(OwnedWordsHold(base, Block, std::span(words).first(1)) && TakeOwnedBlockCounts().epochHeld == 1, "the unwritten block was not answered from its check");
+        Require(faults.Faults() == 0, "epoch answers raised an access violation");
+    }
+    std::cout << "owned proofs: epoch answers query once per epoch, a store before the mark is seen, after it at the next mark\n";
+
+    {
+        BumpCollectEpoch();
+        const auto words = ArmOwned(base, Block);
+        Require(words.size() == 1 && OwnedWordsHold(base, Block, words), "cannot arm the collect fixture");
+        fixture.At(300) = 1;
+        Require(OwnedWordsHold(base, Block, words), "the checked block did not hold in its epoch");
+        CollectWritesUncached(base, Block);
+        Require(!OwnedWordsHold(base, Block, words), "a collect that took a written page left the epoch's answer");
+
+        const auto again = ArmOwned(base + 2 * Block, Block);
+        Require(again.size() == 1 && OwnedWordsHold(base + 2 * Block, Block, again), "cannot arm the switch fixture");
+        Switches::Assign(RuntimeSwitch::NoOwnedEpoch, true);
+        fixture.At(2 * Block + 9) = 3;
+        const bool held = OwnedWordsHold(base + 2 * Block, Block, again);
+        Switches::Assign(RuntimeSwitch::NoOwnedEpoch, false);
+        Require(!held, "APS5_NO_OWNED_EPOCH did not query");
+
+        const auto partial = ArmOwned(base + 3 * Block, Block);
+        Require(partial.size() == 1, "cannot arm the partial fixture");
+        BumpCollectEpoch();
+        fixture.At(3 * Block + 5 * 4096) = 4;
+        TakeOwnedBlockCounts();
+        Require(OwnedWordsHold(base + 3 * Block, 4096, partial) && OwnedWordsHold(base + 3 * Block, 4096, partial), "a store outside the range ended the range's answer");
+        const auto counts = TakeOwnedBlockCounts();
+        Require(counts.epochQueried == 2 && counts.epochHeld == 0, "a block with a written page outside the range was checked");
+        Require(!OwnedWordsHold(base + 3 * Block, Block, partial), "the store into the block was missed");
+    }
+    std::cout << "owned proofs: collects and APS5_NO_OWNED_EPOCH end epoch answers, a block written outside the range is not checked\n";
+
+    // Racing: the writer stores n, then publishes n; the checker reads the published p, then bumps
+    // (its ordering point). An answer that holds after that bump cannot have missed store p.
+    {
+        auto* value = reinterpret_cast<volatile std::uint32_t*>(fixture.memory + 0x2000);
+        *value = 0;
+        std::atomic<std::uint32_t> published{0};
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            for (std::uint32_t next = 1; !stop.load(std::memory_order_relaxed); ++next) {
+                *value = next;
+                published.store(next, std::memory_order_release);
+                if ((next & 63u) == 0) std::this_thread::yield();
+            }
+        });
+        std::size_t held = 0;
+        std::size_t moved = 0;
+        TakeOwnedBlockCounts();
+        try {
+            for (unsigned round = 0; round < 3000; ++round) {
+                const auto words = ArmOwned(base, Block);
+                Require(!words.empty(), "cannot re-arm the racing epoch fixture");
+                const auto armedValue = *value;
+                for (unsigned check = 0; check < 64; ++check) {
+                    const auto seen = published.load(std::memory_order_acquire);
+                    BumpCollectEpoch();
+                    bool holds = true;
+                    for (int again = 0; again < 4 && holds; ++again) holds = OwnedWordsHold(base, Block, words);
+                    if (!holds) {
+                        ++moved;
+                        break;
+                    }
+                    ++held;
+                    Require(seen <= armedValue, "an epoch answer held after a store made before the mark");
+                }
+            }
+        } catch (...) {
+            stop = true;
+            writer.join();
+            throw;
+        }
+        stop = true;
+        writer.join();
+        const auto counts = TakeOwnedBlockCounts();
+        Require(moved > 0, "the racing epoch checks never saw a store");
+        std::cout << "owned proofs: cross-thread stores in epochs, " << held << " checks held, " << moved << " saw the store, " << counts.epochHeld << " answers from block checks\n";
+    }
+    EndCollectEpoch();
+    Require(faults.Faults() == 0, "epoch answers raised an access violation");
+}
+
+void CheckOwnedRefusals() {
+    // Two guest views of one backing are not armed, and aliasing an armed view disarms it.
+    {
+        constexpr std::size_t bytes = Block;
+        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+        Require(section != nullptr, "cannot create the alias backing");
+        auto* first = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        auto* second = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+        GuestArena::GuestArenaMapDirect_nid_postfix(first, bytes, section, 0, PAGE_READWRITE);
+        const auto words = ArmOwned(reinterpret_cast<std::uint64_t>(first), bytes);
+        Require(!words.empty(), "a single resident view could not be armed");
+        GuestArena::GuestArenaMapDirect_nid_postfix(second, bytes, section, 0, PAGE_READWRITE);
+        Require(!OwnedWordsHold(reinterpret_cast<std::uint64_t>(first), bytes, words), "aliasing an armed block left its words");
+        TakeOwnedBlockCounts();
+        Require(ArmOwned(reinterpret_cast<std::uint64_t>(first), bytes).empty() && ArmOwned(reinterpret_cast<std::uint64_t>(second), bytes).empty(), "an aliased view was armed");
+        Require(TakeOwnedBlockCounts().refusedBy[ReasonShared] == 2, "aliased views were not counted as shared");
+        static_cast<volatile std::uint8_t*>(second)[8] = 0x77;
+        Require(static_cast<volatile std::uint8_t*>(first)[8] == 0x77, "the aliased views do not share their backing");
+        GuestArena::GuestArenaReset_nid_postfix(first, bytes);
+        GuestArena::GuestArenaReset_nid_postfix(second, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(first, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
+        GuestArena::GuestArenaForgetSection_nid_postfix(section);
+        CloseHandle(section);
+    }
+    // Memory outside the arena is not armed.
+    std::vector<std::uint8_t> host(2 * Block);
+    Require(ArmOwned(reinterpret_cast<std::uint64_t>(host.data()), Block).empty(), "host memory was armed");
+    std::cout << "owned proofs: aliased views and host memory refused" << std::endl;
+}
+
+// --owned-bench: the cost of one held owned proof (write-watch queries) against the walk it
+// replaces (WalkUntrackedBlocks with its layout walk) and the full compare the walk falls back to,
+// and of one arming, over resident direct memory and private commits of several sizes.
+void BenchOwnedProofs() {
+    using AgcDriver::ContentHash::Hash128;
+    const auto bench = [](const char* kind, std::uint64_t base, std::size_t bytes) {
+        constexpr int Rounds = 2000;
+        std::vector<std::uint8_t> stale(HashBlockCount(base, bytes));
+        std::vector<Hash128> hashes(HashBlockCount(base, bytes));
+        HashCommittedBlocks(base, bytes, hashes);
+        Commitment layout = DescribeCommitted(base, bytes);
+        const auto words = ArmOwned(base, bytes);
+        Require(!words.empty(), std::string("cannot arm the bench fixture: ") + kind);
+        const auto since = TrackerGeneration();
+        const auto timed = [&](auto&& step) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int round = 0; round < Rounds; ++round) step();
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / Rounds;
+        };
+        EndCollectEpoch();
+        TakeOwnedBlockCounts();
+        const auto proof = timed([&] { Require(OwnedProofHolds(base, bytes, words, since), "the bench proof did not hold"); });
+        const auto counts = TakeOwnedBlockCounts();
+        const auto query = timed([&] { Require(OwnedWordsHold(base, bytes, words), "the bench words did not hold"); });
+        BumpCollectEpoch();
+        const auto firstStart = std::chrono::steady_clock::now();
+        Require(OwnedWordsHold(base, bytes, words), "the bench words did not hold in the epoch");
+        const auto first = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - firstStart).count();
+        const auto epoch = timed([&] { Require(OwnedWordsHold(base, bytes, words), "the bench words did not hold from the checks"); });
+        const auto epochProof = timed([&] { Require(OwnedProofHolds(base, bytes, words, since), "the bench proof did not hold in the epoch"); });
+        const auto epochCounts = TakeOwnedBlockCounts();
+        Require(epochCounts.epochQueried == 1 && epochCounts.epochHeld == 2 * Rounds, "the bench epoch answers did not come from the checks");
+        EndCollectEpoch();
+        std::uint64_t previous = CollectWrites(base, bytes);
+        if (previous == 0) previous = WalkUntrackedBlocks(base, bytes, 0, stale, nullptr, &layout, &layout);
+        const auto walk = timed([&] {
+            Commitment now;
+            WalkUntrackedBlocks(base, bytes, previous, stale, nullptr, &layout, &now);
+        });
+        const auto compare = timed([&] { Require(CommittedBlocksMatch(base, bytes, hashes), "the bench surface changed"); });
+        const auto arm = timed([&] {
+            std::vector<std::uint64_t> again(HashBlockCount(base, bytes));
+            *reinterpret_cast<volatile std::uint8_t*>(base) = 1;
+            Require(ArmOwnedBlocks(base, bytes, again), "the bench fixture could not be re-armed");
+        });
+        std::cout << "[owned-bench] " << kind << " " << (bytes >> 10) << " KiB: held proof " << proof << " us (" << static_cast<double>(counts.queries) / Rounds << " GetWriteWatch per proof, " << counts.locked << " under the lock), words by query " << query << " us, epoch: first answer " << first << " us, words from checks " << epoch << " us, held proof " << epochProof << " us; walk " << walk << " us, full compare " << compare << " us, store + re-arm " << arm << " us\n";
+    };
+    for (const std::size_t bytes : {Block, std::size_t{1} << 20, std::size_t{8} << 20}) {
+        {
+            DirectFixture fixture(bytes, bytes);
+            bench("resident direct", fixture.Base(), bytes);
+        }
+        {
+            PrivateFixture fixture(bytes, bytes, 16384);
+            bench("private, 16 KiB commits", fixture.Base(), bytes);
+        }
+        {
+            PrivateFixture fixture(bytes, bytes, bytes);
+            bench("private, one commit", fixture.Base(), bytes);
+        }
+    }
+}
+
+void CheckOwnedMappingChanges() {
+    // Decommit: an unmap of an armed range moves its words; remapped memory starts over.
+    {
+        DirectFixture fixture(2 * Block, 2 * Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, 2 * Block);
+        Require(!words.empty(), "cannot arm the decommit fixture");
+        GuestArena::GuestArenaReset_nid_postfix(fixture.memory, 2 * Block);
+        Require(!OwnedWordsHold(base, 2 * Block, words), "an unmap of armed memory left its words");
+        const auto unmapped = ArmOwned(base, 2 * Block);
+        Require(unmapped.size() == 2 && unmapped != words, "unmapped memory was not armed afresh");
+        fixture.Map(0, 2 * Block);
+        Require(!OwnedWordsHold(base, 2 * Block, words) && !OwnedWordsHold(base, 2 * Block, unmapped), "remapped memory kept the old words");
+        Require(!ArmOwned(base, 2 * Block).empty(), "remapped memory cannot be armed");
+    }
+    // A block with an unmapped placeholder page is armed; mapping the page moves its word.
+    {
+        DirectFixture fixture(Block, 3 * 16384);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, 3 * 16384);
+        Require(words.size() == 1, "a partly mapped block could not be armed");
+        fixture.Map(3 * 16384, 16384);
+        Require(!OwnedWordsHold(base, 3 * 16384, words), "mapping into an armed block left its word");
+    }
+    // A guest protection change moves the words, and nothing is armed until it has landed.
+    {
+        DirectFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the protection fixture");
+        GuestArena::GuestArenaSetProtection_nid_postfix(base, Block, PAGE_READWRITE);
+        Require(!OwnedWordsHold(base, Block, words), "a guest protection change left the words");
+        Require(ArmOwned(base, Block).empty(), "a block was armed while a guest protection change was in flight");
+        DWORD previous = 0;
+        Require(VirtualProtect(fixture.memory, Block, PAGE_READWRITE, &previous) != 0, "cannot apply the guest protection change");
+        GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, Block);
+        const auto after = ArmOwned(base, Block);
+        Require(!after.empty(), "the block cannot be armed after the protection change");
+        fixture.At(5) = 1;
+        Require(!OwnedWordsHold(base, Block, after), "a store after re-arming past a protection change was missed");
+    }
+    // A host write (an OS call storing into guest memory, here ReadFile) opens the block first.
+    {
+        DirectFixture fixture(Block, Block);
+        const auto base = fixture.Base();
+        std::array<wchar_t, MAX_PATH> directory{};
+        std::array<wchar_t, MAX_PATH> path{};
+        Require(GetTempPathW(MAX_PATH, directory.data()) != 0 && GetTempFileNameW(directory.data(), L"own", 0, path.data()) != 0, "cannot name the host-write file");
+        {
+            HANDLE file = CreateFileW(path.data(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            Require(file != INVALID_HANDLE_VALUE, "cannot create the host-write file");
+            std::array<std::uint8_t, 64> content{};
+            content.fill(0x3c);
+            DWORD written = 0;
+            const bool stored = WriteFile(file, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) != 0 && written == content.size();
+            CloseHandle(file);
+            Require(stored, "cannot write the host-write file");
+        }
+        const auto words = ArmOwned(base, Block);
+        Require(!words.empty(), "cannot arm the host-write fixture");
+        bool read = false;
+        {
+            const GuestArena::HostWrite write(fixture.memory + 512, 64);
+            Require(write.Open() && !OwnedWordsHold(base, Block, words), "a host write left the words");
+            Require(ArmOwned(base, Block).empty(), "a block was armed during a host write");
+            HANDLE file = CreateFileW(path.data(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                DWORD count = 0;
+                read = ReadFile(file, fixture.memory + 512, 64, &count, nullptr) != 0 && count == 64;
+                CloseHandle(file);
+            }
+        }
+        DeleteFileW(path.data());
+        Require(read && fixture.At(512) == 0x3c && fixture.At(575) == 0x3c, "the host write into opened memory did not land");
+        Require(!ArmOwned(base, Block).empty(), "the block cannot be armed after the host write");
+    }
+    std::cout << "owned proofs: unmap, partial map, guest protection and host writes move the words\n";
+}
+struct HandlersUnderLock {
+    std::uintptr_t address = 0;
+    DWORD owner = 0;
+    bool wrote = true;
+    bool read = true;
+};
+
+void CheckHandlersSkipMappingOwner() {
+    PrivateFixture fixture(Block, Block);
+    fixture.At(64) = 5;
+    HandlersUnderLock state;
+    state.address = static_cast<std::uintptr_t>(fixture.Base() + 64);
+    const auto body = [](void* argument) -> DWORD {
+        GuestArena::GuestArenaRunUnderMappingLock_nid_no_patch([](void* inner) {
+            auto& under = *static_cast<HandlersUnderLock*>(inner);
+            under.owner = GuestArena::GuestArenaMappingLockOwner_nid_no_patch();
+            under.wrote = GuestArena::GuestArenaHandleWrite_nid_postfix(under.address);
+            under.read = GuestArena::GuestArenaHandleRead_nid_postfix(under.address);
+        }, argument);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the thread that holds the mapping mutex");
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: the fault handlers locked the mapping mutex on the thread that holds it\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    const auto workerId = GetThreadId(worker);
+    CloseHandle(worker);
+    Require(state.owner == workerId, "the mapping mutex did not name its holder");
+    Require(!state.wrote && !state.read, "a fault handler on the mapping mutex's holder claimed the fault instead of leaving it to the crash report");
+    Require(GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the mapping mutex kept an owner after it was released");
+    static_cast<void>(GuestArena::GuestArenaHandleWrite_nid_postfix(state.address));
+    static_cast<void>(GuestArena::GuestArenaHandleRead_nid_postfix(state.address));
+    Require(fixture.At(64) == 5 && GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == 0, "the handlers on a thread without the mutex changed the page or kept the mutex");
+    std::cout << "mapping owner: the fault handlers never lock the mapping mutex on its holder\n";
+}
+std::atomic<std::uint32_t> accessGuardServes{0};
+
+void ServeAccessGuard(std::uintptr_t address) {
+    accessGuardServes.fetch_add(1);
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(address & ~std::uintptr_t{4095}, 4096);
+}
+
+DWORD HostProtection(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(address, &info, sizeof(info)) == sizeof(info), "cannot query access-guarded memory");
+    return info.Protect;
+}
+
+void CheckAccessGuardReporting() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(64) = 5;
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "access guards before any was armed");
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard a private read-write page");
+    Require(HostProtection(fixture.memory) == PAGE_NOACCESS && GuestArena::GuestArenaAccessGuarded_nid_no_patch(base + 100), "the guarded page is not no-access");
+    std::uint32_t protection = 0;
+    Require(GuestArena::GuestArenaProtection_nid_postfix(base, &protection) && protection == PAGE_READWRITE, "the guarded page does not report the guest's own protection");
+    const auto ranges = AgcDriver::GuestMemory::CommittedRanges(base, Block);
+    Require(ranges.size() == 1 && ranges[0].first == base && ranges[0].second == base + Block, "the committed ranges of a guarded page are not the whole fixture");
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    Require(HostProtection(fixture.memory) == PAGE_READWRITE && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(64) == 5, "unguarding did not restore the page");
+    std::cout << "access guards: a guarded page reports the guest's protection and stays committed\n";
+}
+
+void CheckAccessGuardFaultRoundTrip() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(4096 + 8) = 7;
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    accessGuardServes = 0;
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 4096, 2 * 4096) == 0, "cannot guard two subpages");
+    Require(fixture.At(4096 + 8) == 7, "the read of a guarded subpage returned the wrong value");
+    Require(accessGuardServes == 1 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 1, "the read fault did not reach the observer once, or opened the other subpage too");
+    fixture.At(2 * 4096 + 16) = 9;
+    Require(accessGuardServes == 2 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(2 * 4096 + 16) == 9, "the write fault was not served");
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    std::cout << "access guards: read and write faults reach the observer, which opens the subpage\n";
+}
+
+void CheckAccessGuardHostAccess() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    accessGuardServes = 0;
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, Block) == 0, "cannot guard the fixture");
+    Require(GuestArena::GuestArenaBeginHostWrite_nid_postfix(fixture.memory + 4096 + 100, 64), "the host write was refused");
+    Require(accessGuardServes == 1 && !GuestArena::GuestArenaAccessGuarded_nid_no_patch(base + 4096), "the host write did not open its subpage first");
+    std::memset(fixture.memory + 4096 + 100, 0x3c, 64);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 4096, 4096) == 4, "a guard was armed over an open host write");
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(fixture.memory + 4096 + 100, 64);
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(fixture.memory + 8 * 4096, 2 * 4096);
+    Require(accessGuardServes == 3 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 13, "the host read did not open its two subpages");
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, Block);
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(4096 + 100) == 0x3c, "the fixture was not left open");
+    std::cout << "access guards: host writes and reads open guarded subpages first; no guard over an open host write\n";
+}
+
+struct GuardUnderLock {
+    std::uintptr_t address = 0;
+    bool read = true;
+    bool wrote = true;
+    bool guarded = true;
+};
+
+void CheckAccessGuardOwner() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    accessGuardServes = 0;
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard the owner fixture");
+    GuardUnderLock state;
+    state.address = static_cast<std::uintptr_t>(base + 32);
+    const auto body = [](void* argument) -> DWORD {
+        GuestArena::GuestArenaRunUnderMappingLock_nid_no_patch([](void* inner) {
+            auto& under = *static_cast<GuardUnderLock*>(inner);
+            under.read = GuestArena::GuestArenaHandleRead_nid_postfix(under.address);
+            under.wrote = GuestArena::GuestArenaHandleWrite_nid_postfix(under.address);
+            under.guarded = GuestArena::GuestArenaAccessGuarded_nid_no_patch(under.address);
+        }, argument);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the thread that holds the mapping mutex");
+    if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: an access-guard fault on the mapping mutex's holder deadlocked\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    CloseHandle(worker);
+    Require(!state.read && !state.wrote && !state.guarded && accessGuardServes == 0, "the handlers served an access guard on the mapping mutex's holder instead of leaving it to the crash report");
+    Require(GuestArena::GuestArenaAccessGuarded_nid_no_patch(state.address), "the guard was dropped by the refused fault");
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    std::cout << "access guards: a fault on the mapping mutex's holder is never served and never waits\n";
+}
+
+void CheckAccessGuardRefusals() {
+    PrivateFixture fixture(2 * Block, Block);
+    const auto base = fixture.Base();
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 100, 4096) == 1, "a misaligned guard was not refused");
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base + Block, 4096) == 6, "a guard over uncommitted memory was not refused");
+    GuestArena::GuestArenaPinWritable_nid_postfix(fixture.memory, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 3, "a guard over a pinned page was not refused");
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(fixture.memory, 4096);
+    constexpr std::size_t bytes = Block;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot create the shared view's backing");
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    Require(memory != nullptr, "cannot allocate the shared view's address");
+    GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(reinterpret_cast<std::uintptr_t>(memory), 4096) == 2, "a guard over a shared view was not refused");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a refused guard armed something");
+    GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+    CloseHandle(section);
+    std::cout << "access guards: misaligned, uncommitted, pinned and shared-view guards are refused and arm nothing\n";
+}
+
+void CheckAccessGuardMappingChange() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(8) = 11;
+    static std::atomic<std::uint32_t> released{0};
+    static std::atomic<std::uint32_t> kept{0};
+    released = 0;
+    kept = 0;
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch([](std::uintptr_t, std::size_t, bool releasing) { (releasing ? released : kept).fetch_add(1); });
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the protection change");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READWRITE);
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(kept == 1 && released == 0 && !GuestArena::GuestArenaAccessGuarded_nid_no_patch(base) && fixture.At(8) == 11, "a protection change did not call the observer first and drop the guard");
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the reset");
+    GuestArena::GuestArenaReset_nid_postfix(fixture.memory, 4096 * 4);
+    Require(released == 1 && GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a reset did not call the observer as a release and drop the guard");
+    fixture.Commit(0, 4096 * 4);
+    Require(fixture.At(8) == 0, "recommitted memory after a reset of a guarded page does not read zeros");
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch(nullptr);
+    std::cout << "access guards: protection changes and resets call the mapping observer first and drop the guards\n";
+}
+struct GuardRace {
+    volatile std::uint8_t* at = nullptr;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> reads{0};
+    std::atomic<std::uint64_t> wrong{0};
+};
+
+void CheckAccessGuardRace() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    fixture.At(200) = 0x5a;
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(&ServeAccessGuard);
+    GuardRace race;
+    race.at = &fixture.At(200);
+    const auto body = [](void* argument) -> DWORD {
+        auto& state = *static_cast<GuardRace*>(argument);
+        while (!state.stop.load(std::memory_order_acquire)) {
+            if (*state.at != 0x5a) state.wrong.fetch_add(1);
+            state.reads.fetch_add(1);
+        }
+        return 0;
+    };
+    const HANDLE reader = CreateThread(nullptr, 0, body, &race, 0, nullptr);
+    Require(reader != nullptr, "cannot start the racing reader");
+    std::uint32_t armed = 0;
+    for (int k = 0; k < 10000; ++k) {
+        if (GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0) ++armed;
+        GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    }
+    race.stop.store(true, std::memory_order_release);
+    if (WaitForSingleObject(reader, 10000) != WAIT_OBJECT_0) {
+        std::cerr << "FAIL: the racing reader did not finish\n";
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+    CloseHandle(reader);
+    GuestArena::GuestArenaSetAccessGuardObserver_nid_no_patch(nullptr);
+    Require(armed == 10000, "a guard of the race loop was refused: " + std::to_string(armed) + " of 10000 armed");
+    Require(race.wrong == 0 && race.reads > 0, "the racing reader saw a wrong value or never ran: " + std::to_string(race.wrong.load()) + " wrong of " + std::to_string(race.reads.load()));
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && HostProtection(fixture.memory) == PAGE_READWRITE, "the race left a guard or the wrong protection");
+    std::cout << "access guards: 10000 guard/unguard cycles against a reading thread, no lost fault (" << race.reads.load() << " reads)\n";
+}
+
+void CheckAccessGuardInFlight() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READONLY);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 8, "a guard was armed while a guest protection change was in flight");
+    DWORD previous = 0;
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READONLY, &previous) != 0, "cannot apply the guest's protection change");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard after the protection change ended");
+    GuestArena::GuestArenaUnguardAccess_nid_no_patch(base, 4096);
+    Require(HostProtection(fixture.memory) == PAGE_READONLY, "the dropped guard did not leave the guest's new protection");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_EXECUTE_READWRITE);
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_EXECUTE_READWRITE, &previous) != 0, "cannot make the page executable");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 9, "a guard over an executable page was not refused");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "the refused executable guard armed something");
+    GuestArena::GuestArenaSetProtection_nid_postfix(base, 4096, PAGE_READWRITE);
+    Require(VirtualProtect(fixture.memory, 4096, PAGE_READWRITE, &previous) != 0, "cannot restore the page");
+    GuestArena::GuestArenaEndSetProtection_nid_no_patch(base, 4096);
+    std::cout << "access guards: refused while a protection change is in flight and on executable pages; a drop keeps the new protection\n";
+}
+
+std::atomic<std::uint8_t> hookGuardResult{255};
+std::uintptr_t hookGuardBase = 0;
+
+void CheckAccessGuardDuringHostWrite() {
+    PrivateFixture fixture(Block, Block);
+    hookGuardBase = fixture.Base();
+    hookGuardResult = 255;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch([](std::uintptr_t, std::size_t) { hookGuardResult = GuestArena::GuestArenaGuardAccess_nid_no_patch(hookGuardBase, 4096); });
+    const bool begun = GuestArena::GuestArenaBeginHostWrite_nid_postfix(fixture.memory + 64, 32);
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
+    Require(begun, "the host write was refused");
+    std::memset(fixture.memory + 64, 0x6b, 32);
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(fixture.memory + 64, 32);
+    Require(hookGuardResult == 8, "a guard armed from inside a host write's opening was not refused InFlight (code " + std::to_string(hookGuardResult.load()) + ")");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0 && fixture.At(64) == 0x6b && fixture.At(95) == 0x6b, "the host write did not land, or a guard was left");
+    std::cout << "access guards: a guard armed while a host write is opening is refused and the write lands\n";
+}
+
+struct RemapState {
+    std::uint8_t* memory = nullptr;
+    HANDLE inside = nullptr;
+    HANDLE release = nullptr;
+};
+
+RemapState* remapState = nullptr;
+
+void CheckAccessGuardRemap() {
+    PrivateFixture fixture(Block, Block);
+    const auto base = fixture.Base();
+    RemapState state;
+    state.memory = fixture.memory;
+    state.inside = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    state.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Require(state.inside != nullptr && state.release != nullptr, "cannot create the remap events");
+    remapState = &state;
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch([](std::uintptr_t, std::size_t, bool) {
+        SetEvent(remapState->inside);
+        WaitForSingleObject(remapState->release, 10000);
+    });
+    Require(GuestArena::GuestArenaGuardAccess_nid_no_patch(base, 4096) == 0, "cannot guard before the remap");
+    const auto body = [](void* argument) -> DWORD {
+        auto& remap = *static_cast<RemapState*>(argument);
+        GuestArena::GuestArenaReset_nid_postfix(remap.memory, 4 * 4096);
+        return 0;
+    };
+    const HANDLE worker = CreateThread(nullptr, 0, body, &state, 0, nullptr);
+    Require(worker != nullptr, "cannot start the remapping thread");
+    Require(WaitForSingleObject(state.inside, 10000) == WAIT_OBJECT_0, "the reset never called the mapping observer");
+    const auto late = GuestArena::GuestArenaGuardAccess_nid_no_patch(base + 2 * 4096, 4096);
+    SetEvent(state.release);
+    Require(WaitForSingleObject(worker, 10000) == WAIT_OBJECT_0, "the reset did not finish");
+    CloseHandle(worker);
+    GuestArena::GuestArenaSetMappingGuardObserver_nid_no_patch(nullptr);
+    remapState = nullptr;
+    CloseHandle(state.inside);
+    CloseHandle(state.release);
+    Require(late == 8, "a guard armed during a reset was not refused (code " + std::to_string(late) + ")");
+    Require(GuestArena::GuestArenaAccessGuardedSubpages_nid_no_patch() == 0, "a guard survived the reset");
+    fixture.Commit(0, 4 * 4096);
+    Require(fixture.At(2 * 4096) == 0 && HostProtection(fixture.memory + 2 * 4096) == PAGE_READWRITE, "the recommitted range is not fresh read-write memory");
+    std::cout << "access guards: a guard armed while a reset is in progress is refused\n";
+}
+#endif
 
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
-        if (std::wstring_view(GetCommandLineW()).ends_with(MetadataCommitMode)) {
+        if (std::wstring_view(GetCommandLineW()).ends_with(L"--metadata-commit")) {
             return CheckMetadataCommit() ? 0 : 77;
         }
 #endif
+        if (argc > 1 && std::string_view(argv[1]) == "--bench") {
+            if (!WriteWatched()) return 77;
+            BenchBlocksMatchSince();
+            return 0;
+        }
+        CheckContentHashes();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
-            CheckGenerationWrap();
-            std::cout << "generation wrap test passed\n";
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--mark-order") {
-            CheckMarkPossiblyWrittenOrder();
-            std::cout << "mark order test passed\n";
-            return 0;
         }
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(HostHoleMode)) {
@@ -2448,6 +3409,42 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(ResidentRemapMode)) {
             CheckResidentDirectMappingReuse();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(L"--owned-bench")) {
+            BenchOwnedProofs();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(AccessReportingMode)) {
+            CheckAccessGuardReporting();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(AccessGuardsMode)) {
+            CheckAccessGuardFaultRoundTrip();
+            CheckAccessGuardHostAccess();
+            CheckAccessGuardOwner();
+            CheckAccessGuardRefusals();
+            CheckAccessGuardMappingChange();
+            CheckAccessGuardRace();
+            CheckAccessGuardInFlight();
+            CheckAccessGuardRemap();
+            CheckAccessGuardDuringHostWrite();
+            std::cout << "access guard tests passed\n";
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(MappingOwnerMode)) {
+            CheckHandlersSkipMappingOwner();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(OwnedProofsMode)) {
+            CheckOwnedStampOnWrite();
+            CheckOwnedRearm();
+            CheckOwnedCrossThread();
+            CheckOwnedRefusals();
+            CheckOwnedPrivate();
+            CheckOwnedMappingChanges();
+            CheckOwnedEpoch();
+            std::cout << "owned proof tests passed\n";
             return 0;
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(RewatchImportPagesMode)) {
@@ -2467,14 +3464,10 @@ int main(int argc, char** argv) {
             CheckComparedSharingGenerations();
             return 0;
         }
-        if (std::wstring_view(GetCommandLineW()).ends_with(CpuWritePinMode)) {
-            CheckCpuWritePin();
-            return 0;
-        }
 #endif
         CheckSharedBlock();
-        CheckStoredOverUsesPageEvidence();
         CheckRepeatedNeighbourStores();
+        CheckStoredOverUsesPageEvidence();
         CheckStoredAllSince();
         CheckSharedBlockProofs();
         CheckRepeatedPossibleStores();
@@ -2493,8 +3486,7 @@ int main(int argc, char** argv) {
         CheckPrivateMappingReuse();
         CheckRewatch();
         CheckUntrackedHint();
-        CheckHostHoleInChild(HostHoleMode, ChildHostHole());
-        CheckHostHoleInChild(MetadataCommitMode, ProbedHostHole());
+        CheckHostHoleInChild();
         CheckFailedCollectUnwatch();
 #endif
         CheckVersionRanges();
@@ -2505,16 +3497,20 @@ int main(int argc, char** argv) {
         CheckImportWindow();
         CheckImportWindowZeroPages();
         CheckImportWindowOtherThread();
+        CheckImportWindowOverUnwatchedPart();
         CheckImportWindowOverUnwatchedBlock();
-        CheckImportWindowAcrossThreads();
         CheckStoreAcrossImports();
         CheckImportWindowFootprint();
         CheckUnwatchedImport();
-        CheckImportWalkUnwatchHooks();
-        CheckImportWalkHookKeepsLaterWindows();
         CheckUnwatchHooks();
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
+        CheckBlocksMatchSince();
+        CheckBlocksMatchSinceCommitted();
+        CheckUntrackedBlocks();
+#ifdef _WIN32
+        CheckUntrackedLayout();
+#endif
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

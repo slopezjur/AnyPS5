@@ -44,7 +44,8 @@ private:
     std::span<const std::byte> file;
     std::span<const PackRecord> records;
     std::string error;
-    std::shared_ptr<const void> owner;
+    void* mapping = nullptr;
+    void* fileHandle = nullptr;
 };
 
 }

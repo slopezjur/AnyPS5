@@ -21,13 +21,11 @@ public:
     Sampler& operator=(const Sampler&) = delete;
 
     bool ForcesDegamma() const;
-    bool DisablesDegamma() const;
     VkSampler Handle() const;
     bool RequiresFilterMinmax() const;
     bool ReadsOpaqueBlackBorder() const;
     bool RequiresNonSeamlessCube() const;
     static void Validate(const Context& context, const GuestSamplerResource& descriptor);
-    static bool ShaderAppliesLodBias(const GuestSamplerResource& descriptor);
     static bool ReadsOpaqueBlackBorder(const GuestSamplerResource& descriptor);
 
 private:
@@ -35,7 +33,6 @@ private:
 
     Context context;
     bool forcesDegamma = false;
-    bool disablesDegamma = false;
     VkSampler sampler = VK_NULL_HANDLE;
     bool requiresFilterMinmax = false;
     bool opaqueBlackBorder = false;
@@ -53,7 +50,7 @@ public:
     explicit SamplerCache(std::size_t capacity = 1024);
     SamplerCache(const SamplerCache&) = delete;
     SamplerCache& operator=(const SamplerCache&) = delete;
-    std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven = false, bool forceDegammaPaired = false, bool integerBorder = false);
+    std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven = false, bool forceDegammaPaired = false, bool integerBorder = false, bool guardedUnnormalizedWrap = false);
     // APS5_PROFILE_DRAW counters: lookups served by an existing sampler, and samplers created.
     std::uint64_t Hits() const { return hits; }
     std::uint64_t Misses() const { return misses; }
@@ -71,11 +68,10 @@ private:
     std::uint64_t misses = 0;
 };
 
-void RequireFilterMinmax(const Context& context, VkFormat format, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
-bool ForcesDegammaOn(std::uint32_t guestFormat, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
-void RequireBorderSwizzle(std::uint32_t bcSwizzle, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
-void RequireNonSeamlessCube(bool cube, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
-void RequireDisablesDegammaOn(std::uint32_t guestFormat, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireFilterMinmax(const Context& context, VkFormat format, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+bool ForcesDegammaOn(std::uint32_t guestFormat, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireBorderSwizzle(std::uint32_t bcSwizzle, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireNonSeamlessCube(bool cube, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
 
 }
 

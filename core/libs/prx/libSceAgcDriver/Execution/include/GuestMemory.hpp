@@ -2,15 +2,17 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <span>
-#include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/ContentHash.hpp"
 
 namespace AgcDriver::GuestMemory {
 
@@ -53,10 +55,97 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so
 // guest writes made meanwhile to untouched bytes survive. Compares in 256-byte blocks.
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
-void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit);
-std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince);
-std::uint32_t ChangedByteStoreLimit();
-void WriteChangedKeepingGuest(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
+
+// Content hashes standing in for a byte copy where only "do the guest bytes still match" is asked:
+// one ContentHash per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`,
+// each block clipped to the range), so a range starting at the same address or on a block boundary
+// shares the blocks. Uncommitted pages hash as the zeros ReadCommitted reads. No flush hook: the
+// caller flushes first where EqualsCommitted would.
+inline constexpr std::uint64_t HashBlockBytes = 65536;
+std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes);
+void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out);
+// The same blocks of a host copy of the guest bytes at `address`.
+void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::span<ContentHash::Hash128> out);
+// Whether every block of the range still hashes to `expected` (stops at the first differing block).
+bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected);
+struct BlockMatch {
+    std::size_t hashed = 0;
+    std::size_t skipped = 0;
+    std::uint64_t hashedBytes = 0;
+    std::uint64_t skippedBytes = 0;
+};
+bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match = nullptr, const Commitment* layout = nullptr);
+struct UntrackedBlocks {
+    std::size_t covered = 0;
+    std::size_t hinted = 0;
+    std::size_t outside = 0;
+    std::size_t hostRegion = 0;
+    std::size_t unhinted = 0;
+    std::size_t refused = 0;
+    std::size_t partial = 0;
+    std::size_t layoutChanged = 0;
+};
+bool UntrackedLayoutWalks();
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr);
+bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
+
+// Owned blocks (the owned proofs of untracked snapshots, APS5_NO_OWNED_PROOFS; Windows only, see
+// GuestArena::GuestArenaArmOwned_nid_no_patch): the 64 KiB blocks of a range (one word per
+// HashBlockCount block) are write-watched memory whose bits the arming resets (the pages it takes
+// stay reported to the write tracker), so a later CPU store leaves a write bit that
+// OwnedWordsHold finds with GetWriteWatch, without a fault or a protection change; a collect that
+// takes such a bit, every mapping or protection change and every host write opened over a block
+// moves its word. ArmOwnedBlocks arms them all or none. A walk made after it that proves the range
+// current at a tracker generation `since` (WalkUntrackedBlocks, then the compare) stays valid while
+// OwnedProofHolds: every word unchanged and no page written (no CPU store since the arming), no tracker stamp
+// (MarkWritten, a collect, a host-region store) or untracked hint newer than `since` over the range,
+// which is what the walk checks for the driver's and the GPU's writes. Recorded GPU writes not yet
+// stamped are the caller's to check (the write notes, as for the walk).
+// `allowPrivate`: private commits (flexible and memory-pool memory) may be armed too.
+bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
+// On a thread inside a collect epoch (BumpCollectEpoch; the collect memo on, APS5_NO_COLLECT_MEMO
+// unset) an answer may come from the blocks' checks by a GetWriteWatch query that began after the
+// thread's last epoch bump (each bump takes a new owned mark, GuestArenaOwnedMark): a CPU store made
+// before that ordering point is seen, one made after it may be seen only after the next, the rule the
+// collect memo already follows (APS5_NO_OWNED_EPOCH: every answer queries, as before).
+// APS5_VERIFY_OWNED_EPOCH=<n>: the first n such answers of every 10 s are asked again with a query
+// (disagreements: CPU stores after the thread's last ordering point, printed).
+bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
+// `wordsHeld`: the caller has just seen OwnedWordsHold hold for these words (one GetWriteWatch
+// query per proof instead of two).
+bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld = false);
+// Arms (all blocks armed), blocks newly armed (of them with private pages, with nothing mapped, partly
+// mapped: placeholders are proved by the word alone, see WindowsMappings::ownable), arms refused
+// (by reason: outside the arena or a host region, shared or aliased view, pinned or importing, host
+// write open, protection change in flight, not writable or another mapping type, private while not
+// allowed, nothing mapped, not write-watched), guest write faults inside armed blocks (owned blocks
+// never write-protect, so none is theirs), blocks disarmed by a mapping, protection or host-write
+// change, blocks disarmed by a collect that took a CPU-written page, pages whose write bits an arming
+// took, OwnedWordsHold GetWriteWatch queries and those that found a written page, OwnedWordsHold
+// answers asked again under the mapping lock (a collect's reset ran across the first), answers
+// with an epoch mark held from the blocks' checks alone and those that queried, epoch answers
+// verified by a query and those the query found written (see OwnedWordsHold), since the last call.
+struct OwnedBlockCounts {
+    std::uint64_t arms = 0;
+    std::uint64_t armedBlocks = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t faults = 0;
+    std::uint64_t disowned = 0;
+    std::uint64_t privateBlocks = 0;
+    std::uint64_t unmappedBlocks = 0;
+    std::uint64_t partialBlocks = 0;
+    std::uint64_t collected = 0;
+    std::uint64_t taken = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t locked = 0;
+    std::uint64_t epochHeld = 0;
+    std::uint64_t epochQueried = 0;
+    std::uint64_t epochVerified = 0;
+    std::uint64_t epochDisagreed = 0;
+    std::array<std::uint64_t, 9> refusedBy{};
+};
+OwnedBlockCounts TakeOwnedBlockCounts();
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
 // pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new
@@ -70,8 +159,6 @@ void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
-bool UnwatchWritesProven();
-void SetImportWalkFailureForTest(int walk, std::uint64_t span = 0);
 #ifdef _WIN32
 using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context);
 void SetFreshCollectHook(FreshCollectHook hook);
@@ -95,10 +182,28 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 // UnchangedSince(range, it) holds until the next store over the range.
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes);
-std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::uint64_t& order);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// Own GPU write marks (GPU-sourced draw buffers, APS5_GPU_SOURCED_DRAW_BUFFERS): every range of
+// `marks` is marked as MarkPossiblyWritten does (its generation into `generations`), under the one
+// tracker hold that first answers each check: `clean` when nothing stored over its range since its
+// `since` (StoredOver after a fresh collect of its pages, so a CPU store not collected yet counts;
+// for an `owned` range, armed with ArmOwnedBlocks, whose CPU stores its words show, no tracker
+// stamp or untracked hint newer, as OwnedProofHolds), so no store can land between the answer and
+// the marks unseen. Returns the generation after.
+struct OwnWriteCheck {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t since;
+    bool owned = false;
+    bool clean = false;
+};
+std::uint64_t MarkOwnWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> marks, std::span<std::uint64_t> generations, std::span<OwnWriteCheck> checks);
+// Whether a CPU store collected after `generation` (a collect of any kind: the per-page CPU stamps,
+// not the driver's MarkWritten stamps) touched a page of the range. True outside the watched arena,
+// over a host region or for a generation of 0. The caller collects the range first.
+bool CpuStoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
@@ -116,6 +221,11 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+// Back to no epoch (a fresh epoch for every collect, as a thread that never bumped): the presenter's
+// revalidation at a present is one epoch (BumpCollectEpoch at its start, this at its end; the present
+// is its ordering point), so a surface it walks for its staleness check, for the entry's generation and
+// for the texture cache's lookup is walked once.
+void EndCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
@@ -130,7 +240,6 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
-void AdvanceTrackerGenerationForTest(std::uint64_t generation);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
@@ -138,7 +247,6 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label
 // records, which share the title's label blocks. False when the arena is not write-watched.
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
-bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`): `changed[k]`
 // receives whether the block was stamped after generations[k] (UnchangedSince over that block
 // alone), `cpu[k]`, when given, whether a collect stamped it after (a CPU store, as
@@ -218,22 +326,37 @@ unsigned long long CodeOffset(const void* address);
 // every read and store through this interface calls first. Code that reads guest memory directly
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
-auto CurrentFlushHook() -> void (*)(std::uint64_t address, std::size_t bytes);
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);
+void SetGpuOwnedHooks(bool (*owned)(std::uint64_t address, std::size_t bytes), void (*publish)(std::uint64_t address, std::size_t bytes));
+bool GpuOwned(std::uint64_t address, std::size_t bytes);
+void PublishGpuOwned(std::uint64_t address, std::size_t bytes);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes);
-bool StopHostWrites(std::uint32_t boundMs);
-std::uint64_t LockedHostWrites();
-struct HostWriteCounts {
-    std::uint64_t calls = 0;
-    std::uint64_t waited = 0;
-    double waitedMs = 0;
-    double maxWaitedMs = 0;
+class ISpeculativeReadGate {
+public:
+    virtual void Enter() = 0;
+    virtual void Leave() = 0;
+
+protected:
+    ~ISpeculativeReadGate() = default;
 };
-HostWriteCounts HostWritesCounted();
-void SetWaitedMsProvider(double (*provider)());
-std::string HostWriteReport();
+class SpeculativeReadRefused : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+class SpeculativeReadScope {
+public:
+    explicit SpeculativeReadScope(ISpeculativeReadGate& gate);
+    ~SpeculativeReadScope();
+    SpeculativeReadScope(const SpeculativeReadScope&) = delete;
+    SpeculativeReadScope& operator=(const SpeculativeReadScope&) = delete;
+
+private:
+    ISpeculativeReadGate* previous;
+};
+bool SpeculativeReadsSupported();
+bool SpeculativeReader();
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even
 // value before consulting the page states and reading directly, and the same value after, knows

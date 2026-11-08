@@ -1,14 +1,14 @@
+#include "prx/libSceAgcDriver/Execution/include/BindlessPriming.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include <algorithm>
-#include <cstdio>
 #include <mutex>
-#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver {
 
@@ -64,13 +64,13 @@ void AttachWindow(const PresentationWindow& window) {
     DriverDetail::Driver::Get().AttachWindow(window);
 }
 
-void PresentClear(const PresentationWindow& window, bool opaque, const DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
-    DriverDetail::Driver::Get().Present(window, nullptr, plane, opaque, gpuReady, context);
+void PresentClear(const PresentationWindow& window, bool opaque, void (*gpuReady)(void*), void* context) {
+    DriverDetail::Driver::Get().Present(window, nullptr, opaque, gpuReady, context);
 }
 
-void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, const DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
+void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
     if (auto* const recorder = FrameRecorder::Active()) recorder->PresentBuffer(buffer);
-    DriverDetail::Driver::Get().Present(window, &buffer, plane, true, gpuReady, context);
+    DriverDetail::Driver::Get().Present(window, &buffer, true, gpuReady, context);
 }
 
 void ReleaseWindow(void* window) {
@@ -91,15 +91,6 @@ extern "C" void AgcDriverWaitIdle_nid_postfix() try {
     AgcDriver::WaitIdle();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
-}
-
-extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std::uint32_t dwords) {
-    const Packet packet{commands, dwords, 0, {}};
-    AgcDriver::Submit(&packet, 0);
-}
-
-extern "C" void AgcDriverUseGcnShaders_nid_postfix() {
-    ShaderRecompiler::SetGcnGuestShaders(true);
 }
 
 static std::mutex& VulkanLoaderMutex() {
@@ -123,23 +114,10 @@ extern "C" void AgcDriverRequestScreenshot_nid_postfix() {
     AgcDriver::Screenshot::Request();
 }
 
-extern "C" void AgcDriverTracePresent_nid_postfix(std::uint32_t width, std::uint32_t height) {
-    AgcDriver::DriverDetail::Driver::Get().TracePresent(width, height);
-}
-
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) try {
     AgcDriver::RegisterShader(shader);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
-}
-
-extern "C" std::uint32_t AgcDriverInstructionWords_nid_postfix(std::span<const std::uint32_t> code, std::uint32_t index) {
-    try {
-        return ShaderRecompiler::DecodeRdnaInstruction(index * 4u, code, index).wordCount;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[agc] instruction at word %u of a fused front half cannot be decoded: %s\n", index, error.what());
-        return 0;
-    }
 }
 
 extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
@@ -165,8 +143,38 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
     return count;
 }
 
-extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
-    AgcDriver::DriverDetail::Driver::Get().WaitForPipelineJournal();
+extern "C" std::vector<std::uint32_t> AgcDriverSaveQueueStates_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().SaveQueueStates();
+}
+
+extern "C" void AgcDriverLoadQueueStates_nid_postfix(std::span<const std::uint32_t> words) {
+    AgcDriver::DriverDetail::Driver::Get().LoadQueueStates(words);
+}
+
+extern "C" std::vector<std::uint64_t> AgcDriverBindlessRegistrations_nid_postfix() {
+    return AgcDriver::BindlessRegistrationWords();
+}
+
+extern "C" void AgcDriverPrimeBindlessTables_nid_postfix(std::span<const std::uint64_t> words) try {
+    AgcDriver::PrimeBindlessTables(words);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+extern "C" void AgcDriverUseGdsAt_nid_postfix(std::uint64_t address) {
+    AgcDriver::Pm4::UseGdsAt(address);
+}
+
+extern "C" bool AgcDriverSettle_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10));
+}
+
+extern "C" bool AgcDriverFailed_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().Failed();
+}
+
+extern "C" bool AgcDriverQuiescent_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }
 
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {
@@ -191,6 +199,12 @@ extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().DispatchesAdoptedAhead();
 }
 
+extern "C" void AgcDriverMissAheadTotals_nid_postfix(std::uint64_t* started, std::uint64_t* used) {
+    const auto [builds, uses] = AgcDriver::DriverDetail::Driver::MissAheadTotals();
+    *started = builds;
+    *used = uses;
+}
+
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().DispatchesRejectedAhead();
 }
@@ -211,12 +225,12 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     AgcDriver::AttachWindow(window);
 }
 
-extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationWindow& window, bool opaque, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
-    AgcDriver::PresentClear(window, opaque, plane, gpuReady, context);
+extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationWindow& window, bool opaque, void (*gpuReady)(void*), void* context) {
+    AgcDriver::PresentClear(window, opaque, gpuReady, context);
 }
 
-extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
-    AgcDriver::PresentBuffer(window, buffer, plane, gpuReady, context);
+extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
+    AgcDriver::PresentBuffer(window, buffer, gpuReady, context);
 }
 
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
@@ -227,9 +241,13 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
+// ABI resolution prepares programs on the title's thread. A refusal there (APS5_SKIP_REFUSED_SHADERS only)
+// is reported and skipped; the draws and dispatches that use the program are skipped as they come.
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveShaderAbi(shader, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -237,12 +255,17 @@ extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std:
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
+
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }

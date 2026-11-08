@@ -121,7 +121,7 @@ void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
             state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
         }
         if (state.program.Resources().stage != IrShaderStage::Pixel) {
-            EmitReturnReleasingScratch(state);
+            state.module.AddFunction(spv::OpReturn);
         } else if (state.pixelStopFlag != 0u) {
             state.module.AddFunction(spv::OpStore, state.pixelStopFlag, ConstantBool(state, true));
             state.module.AddFunction(spv::OpReturn);

@@ -128,7 +128,8 @@ void Driver::noteCopyWriter(std::uint64_t program, std::uint64_t begin, std::uin
         knownValueEntries.fetch_add(1, std::memory_order_relaxed);
     }
     std::lock_guard lock(writtenBuffersMutex);
-    writtenBuffers.Push({known || !copyKnownValues() ? program : 0, begin, end, ++writtenBufferSerial, queue, false, std::move(known), generation});
+    writtenBuffers.push_back({program, begin, end, ++writtenBufferSerial, queue, false, std::move(known), generation});
+    while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
 
 bool Driver::copyKnownValues() {
@@ -164,7 +165,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     if ((packet[4] & 0x20u) != 0) {
         for (std::uint32_t axis = 0; axis < 3; ++axis) {
             const auto threads = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
-            groups[axis] = ThreadDimensionGroups(groups[axis], threads);
+            groups[axis] = (groups[axis] + threads - 1) / threads;
         }
     }
     if (groups[1] != 1 || groups[2] != 1) {

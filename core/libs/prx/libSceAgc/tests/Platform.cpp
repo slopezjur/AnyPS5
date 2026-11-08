@@ -1,5 +1,4 @@
 #include "prx/libSceAgc/Misc/include/Platform.hpp"
-#include "prx/libSceAgc/include/Agc.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
@@ -35,18 +34,12 @@ void testRejections() {
     expectFailure([] { sceAgcGetIsTrinityMode(nullptr); });
 }
 
-void testExportLinked() {
-    auto* volatile linked = &sceAgcSuspendPointAndCheckStatus;
-    check(linked != nullptr, "sceAgcSuspendPointAndCheckStatus is not linked");
-}
-
 }
 
 int main() {
     try {
         testTrinityMode();
         testRejections();
-        testExportLinked();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC platform tests passed");
         return 0;

@@ -17,8 +17,7 @@ enum class TessellationAttribute {
     PatchInput,
     InstanceOutput,
     InstanceInput,
-    ControlShared,
-    GeometryOutput
+    ControlShared
 };
 
 enum class TessellationBaseKind {
@@ -51,6 +50,7 @@ enum class StageInputKind {
     RasterPrimitive,
     LayerExported,
     BaseInstance,
+    BaseVertex,
     BaryCoordSmoothCenter,
     BaryCoordNoPerspectiveCenter,
     BaryCoordSmoothSample,

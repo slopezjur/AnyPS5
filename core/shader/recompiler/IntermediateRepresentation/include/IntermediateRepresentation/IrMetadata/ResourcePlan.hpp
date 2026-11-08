@@ -32,28 +32,6 @@ struct DescriptorValue {
     bool operator==(const DescriptorValue& other) const = default;
 };
 
-struct RegisteredImageView {
-    std::uint32_t resource = 0;
-    std::uint32_t record = 0;
-    DescriptorValue provenance;
-    DescriptorValue effective;
-    std::uint64_t generation = 0;
-    std::uint64_t address = 0;
-    std::uint64_t rangeAddress = 0;
-    std::uint64_t rangeBytes = 0;
-    std::uint64_t allocationAddress = 0;
-    std::uint64_t allocationBytes = 0;
-    std::uint64_t backingSerial = 0;
-    bool hasRange = false;
-    bool readable = false;
-    bool writable = false;
-    bool gpu = false;
-
-    bool operator==(const RegisteredImageView& other) const {
-        return resource == other.resource && record == other.record && provenance == other.provenance && effective == other.effective && address == other.address && rangeAddress == other.rangeAddress && rangeBytes == other.rangeBytes && allocationAddress == other.allocationAddress && allocationBytes == other.allocationBytes && backingSerial == other.backingSerial && hasRange == other.hasRange && readable == other.readable && writable == other.writable && gpu == other.gpu;
-    }
-};
-
 template <typename T>
 class SharedValues {
 public:
@@ -131,26 +109,22 @@ struct ImageTableColumnSnapshot {
     std::uint32_t keys = 0;
     std::uint32_t fault = 0;
     bool outside = false;
-    bool nested = false;
-    SharedValues<std::uint64_t> pointers;
     SharedValues<std::uint32_t> codes;
     SharedValues<DescriptorValue> words;
     SharedValues<std::pair<std::uint64_t, std::uint64_t>> readRanges;
-    struct ResourceView {
-        std::uint32_t resource = 0;
-        SharedValues<DescriptorValue> words;
-        std::vector<RegisteredImageView> identities;
-
-        bool operator==(const ResourceView& other) const = default;
-    };
-    std::vector<ResourceView> resourceViews;
+    bool pointer = false;
+    bool indirect = false;
+    std::uint32_t addend = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t offset = 0;
+    std::uint32_t dwords = 0;
+    SharedValues<std::uint64_t> addresses;
 
     bool operator==(const ImageTableColumnSnapshot& other) const = default;
 };
 
 struct ImageTableSnapshot {
     std::vector<ImageTableColumnSnapshot> tables;
-    std::vector<ImageTableColumnSnapshot> nested;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t shader = 0;
 
@@ -167,8 +141,6 @@ struct ResourceSnapshot {
     std::vector<SrtReadPoison> srtPoison;
     std::uint32_t nullRootReads = 0;
     ImageTableSnapshot tables;
-    std::vector<RegisteredImageView> registeredImages;
-    std::uint64_t imageAllocationGeneration = 0;
 };
 
 struct UniformFillPlan {
@@ -262,7 +234,6 @@ struct IrResourcePlan {
     std::uint32_t userDataBase = 0;
     std::uint32_t userDataCount = 64;
     std::uint32_t srgbDecodeFormats = 0;
-    std::uint32_t maxImageArrayLayers = 0;
     IrValueArena valueStorage;
     std::vector<std::unique_ptr<IrBlock>> blockStorage;
     std::vector<MemoryInfo> memoryInfo;

@@ -756,7 +756,7 @@ Attempt TryDeliver(Pthread thread, HANDLE native, GuestExceptionHandler handler,
             if (!accepted) throw std::runtime_error("sceKernelRaiseException: cannot queue delivery to the waiting thread");
             return Attempt::Delivered;
         }
-        const bool restoring = RestoringContext(delivery.context.Rip);
+        const bool restoring = GuestArena::GuestArenaMappingLockOwner_nid_no_patch() == GetThreadId(native) || RestoringContext(delivery.context.Rip);
         DWORD64 image = 0;
         const auto running = restoring ? CodeKind::Host : RunningCode(delivery.context.Rip, image);
         if (running == CodeKind::Guest && arm != nullptr && arm->entry != nullptr && delivery.context.Rip == arm->at) {

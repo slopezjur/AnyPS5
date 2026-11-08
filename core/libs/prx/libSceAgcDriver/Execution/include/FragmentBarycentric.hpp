@@ -9,10 +9,6 @@ inline bool FragmentShaderBarycentricUsable(VkDriverId driver, bool reported) {
     return reported && driver != VK_DRIVER_ID_MOLTENVK;
 }
 
-inline bool HostInterpolationPreferred(VkDriverId driver) {
-    return driver == VK_DRIVER_ID_MESA_RADV;
-}
-
 }
 
 #endif

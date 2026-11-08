@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -14,16 +13,6 @@
 #endif
 
 namespace AgcDriver {
-
-std::filesystem::path TraceFile::Directory() {
-#ifdef _WIN32
-    const wchar_t* directory = _wgetenv(L"APS5_TRACE_DIR");
-    return std::filesystem::path(directory != nullptr ? directory : L".");
-#else
-    const char* directory = std::getenv("APS5_TRACE_DIR");
-    return std::filesystem::path(directory != nullptr ? directory : ".");
-#endif
-}
 
 void TraceFile::WriteGzip(const std::filesystem::path& path, std::string_view text) {
     z_stream stream{};
@@ -68,13 +57,7 @@ void TraceFile::WriteGzip(const std::filesystem::path& path, std::string_view te
 void TraceFile::ReplaceGzip(const std::filesystem::path& path, std::string_view text) {
     auto temporary = path;
     temporary += ".tmp";
-    try {
-        WriteGzip(temporary, text);
-    } catch (...) {
-        std::error_code removeError;
-        if (!std::filesystem::is_directory(temporary, removeError)) std::filesystem::remove(temporary, removeError);
-        throw;
-    }
+    WriteGzip(temporary, text);
     std::error_code error;
 #ifdef _WIN32
     if (::MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) error = std::error_code(static_cast<int>(::GetLastError()), std::system_category());

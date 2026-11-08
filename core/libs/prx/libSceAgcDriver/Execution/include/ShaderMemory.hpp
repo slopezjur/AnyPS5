@@ -2,7 +2,6 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
-#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -77,22 +76,31 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    // APS5_PIPELINE_REQUESTS: the accessibility and pending-write probes the captures asked and their
+    // answers, in order. A saved request carries only the words read; these answers came from the
+    // guest mapping and the recorded GPU work at dispatch time, and the materialization depends on them
+    // (an image-table key scan is skipped over a pending write or an unmapped page).
+    struct Probe {
+        std::uint64_t address;
+        std::uint64_t bytes;
+        bool pending;
+        bool answer;
+    };
+    void RecordProbes() { recordProbes = true; }
+    [[nodiscard]] const std::vector<Probe>& Probes() const { return probes; }
     struct SupplyCounts {
         std::uint64_t shared, copied, spilled;
     };
     static SupplyCounts Supplies();
     [[nodiscard]] std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> SuppliedBlocks() const;
-    [[nodiscard]] std::size_t Bytes() const;
     struct VouchCounts {
         std::uint64_t calls, blocks, refused, words;
     };
     static VouchCounts Vouches();
     static bool Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
-    static std::uint64_t descriptorScope(void* context, std::size_t bytes);
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
-    std::shared_ptr<const ShaderRecompiler::ResourceCapture> captureWaitingOnFailure(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
@@ -104,10 +112,6 @@ private:
             return (bits[index / 64u] & block) == block;
         }
         void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
-        void Clear(std::size_t index) { bits[index / 64u] &= ~(std::uint64_t{1} << (index % 64u)); }
-        void ClearMask(const WordMask& other) {
-            for (std::size_t i = 0; i < bits.size(); ++i) bits[i] &= ~other.bits[i];
-        }
         void SetAll() { bits.fill(~std::uint64_t{0}); }
         void SetBlock(std::size_t index) { bits[index / 64u] |= ((std::uint64_t{1} << BlockWords) - 1u) << (index % 64u / BlockWords * BlockWords); }
         void Reset() { bits.fill(0u); }
@@ -125,12 +129,10 @@ private:
     struct Page {
         std::array<std::uint32_t, PageWords> words;
         WordMask valid;
-        WordMask raw;
         WordMask read;
         WordMask recent;
         bool wordwise = false;
         bool lazy = false;
-        std::uint64_t backing = 0;
     };
 
     struct Supplied {
@@ -143,15 +145,12 @@ private:
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
+    static bool accessibleProbe(ShaderMemory& self, std::uint64_t address, std::uint64_t bytes);
     static bool pending(void* context, std::uint64_t address, std::uint64_t bytes);
     static ShaderRecompiler::SrtWriteStamp stampWrites(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool unchangedSince(void* context, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
     static bool supplyWords(void* context, const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>& words);
-    bool invalidateRawPages();
-    bool pagesCurrent();
-    static bool snapshotCurrent(void* context, std::span<const ShaderRecompiler::RegisteredImageView> views);
     Page& page(std::uint64_t base);
-    void preparePage(Page& page, std::uint64_t base);
     [[nodiscard]] std::size_t pageAtOrAfter(std::uint64_t base) const;
     Page& addPage(std::size_t position, std::uint64_t base);
     [[nodiscard]] bool overlapsInitial(std::uint64_t begin, std::uint64_t end) const;
@@ -159,6 +158,7 @@ private:
     void spill(std::size_t index);
     void spillTouching(std::uint64_t begin, std::uint64_t end);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> collect(bool recentOnly) const;
+    [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> merge(bool recentOnly, bool heap) const;
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
@@ -171,13 +171,9 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    bool recordProbes = false;
+    mutable std::vector<Probe> probes;
     PendingWriteQuery pendingSpan = nullptr;
-    bool spanQuery = false;
-    std::size_t descriptorSpanBytes = 0;
-    std::uint64_t rawInvalidations = 0;
-    std::uint32_t forceSync = 0;
-    std::uint64_t branchReadsRefused = 0;
-    bool waitBranches = false;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a
