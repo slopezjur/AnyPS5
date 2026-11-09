@@ -436,11 +436,6 @@ void Driver::executeRewindTail(const Submission& stalled) {
             const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
             std::fprintf(stderr, "[wait-tail] queue 0x%x serial %llu: tail 0x%llx+%zu dwords; wait 0x%llx function %u reference 0x%llx: guest value 0x%llx at entry (%s), waited %.2f ms (%d early so far)\n", stalled.queue, static_cast<unsigned long long>(stalled.serial), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(stalled.rewindTail)), stalled.rewindWords, static_cast<unsigned long long>(wait.address), wait.function, static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(atEntry), held ? "held" : "not held", waitedMs, early.load(std::memory_order_relaxed));
         }
-        {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
-            Graphics::FinishLeaseWork();
-        }
         std::vector<std::byte> landed(stalled.rewindWords * sizeof(std::uint32_t));
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::IndirectArguments);
         GuestMemory::Read(reinterpret_cast<std::uint64_t>(stalled.rewindTail), landed, alignof(std::uint32_t));
