@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "ThreadOwned.hpp"
@@ -112,11 +113,13 @@ void Driver::noteReleasedTails(const Submission& submission) {
     auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
     const std::uint32_t* tail = submission.rewindTail;
     std::size_t words = submission.rewindWords;
-    for (std::size_t chunk = 0; chunk < 256 && tail != nullptr; ++chunk) {
+    bool afterWait = submission.rewindAfterWait;
+    for (std::size_t chunk = 0; chunk < 256 && tail != nullptr && !afterWait; ++chunk) {
         if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(tail - 1)).load(std::memory_order_acquire) & 0x80000000u) == 0) break;
         released.push_back(tail - 1);
         scratch.rewindTail = nullptr;
         scratch.rewindWords = 0;
+        scratch.rewindAfterWait = false;
         try {
             copyCommands(scratch, tail, words);
         } catch (const std::exception&) {
@@ -124,6 +127,7 @@ void Driver::noteReleasedTails(const Submission& submission) {
         }
         tail = scratch.rewindTail;
         words = scratch.rewindWords;
+        afterWait = scratch.rewindAfterWait;
     }
 }
 
@@ -132,11 +136,46 @@ void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, st
     submission.conditionalEnds.clear();
     std::size_t budget = std::size_t{1} << 26u;
     copySegment(submission, guest, words, budget);
+    auto& commands = submission.commands;
+    for (std::size_t cursor = 0; cursor < commands.size();) {
+        const auto header = commands[cursor];
+        if (header == 0 && std::all_of(commands.begin() + static_cast<std::ptrdiff_t>(cursor), commands.end(), [](std::uint32_t word) { return word == 0; })) {
+            commands.resize(cursor);
+            break;
+        }
+        if (!Pm4::FillerPacket(header) && (header & 0xc0000000u) != 0xc0000000u) break;
+        const auto count = Pm4::PacketWords(header);
+        if (count == 0 || count > commands.size() - cursor) break;
+        cursor += count;
+    }
 }
 
 bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget) {
     require(words <= budget, "command buffer jumps exceed the copy limit (a jump loop?)");
     budget -= words;
+    thread_local unsigned depth = 0;
+    struct Nesting {
+        unsigned& depth;
+        explicit Nesting(unsigned& value) : depth(value) { ++depth; }
+        ~Nesting() { --depth; }
+    } nesting(depth);
+    const auto unsatisfiedWait = [&](std::size_t cursor, std::size_t count) {
+        if (depth != 1 || cursor + count >= words || Pm4::Predicated(guest[cursor]) || ((guest[cursor + 1] >> 4u) & 3u) != 1u) return false;
+        const auto packet = std::span(guest + cursor, count);
+        const auto wait = Pm4::DecodeWait(packet);
+        if (wait.bytes != 4 && wait.bytes != 8) return false;
+        try {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(wait.address)), wait.bytes, wait.bytes);
+        } catch (const std::exception&) {
+            return false;
+        }
+        std::uint64_t value = 0;
+        if (wait.bytes == 4) value = std::atomic_ref<const std::uint32_t>(*reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(wait.address))).load(std::memory_order_acquire);
+        else value = std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(wait.address))).load(std::memory_order_acquire);
+        if (Pm4::WaitComparesValue(packet, value)) return false;
+        DeferredWaitAddress().store(wait.address, std::memory_order_release);
+        return true;
+    };
     std::vector<std::pair<std::size_t, std::size_t>> guarded;
     const auto reach = [&](std::size_t cursor, std::size_t next) {
         std::erase_if(guarded, [&](const auto& range) {
@@ -208,6 +247,16 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         }
         if (opcode == 0x22u && count == 5) guarded.emplace_back(cursor + count + Pm4::ConditionalWords(std::span(guest + cursor, count)), submission.commands.size());
         submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
+        if (opcode == 0x3cu && count == 7 && guarded.empty() && unsatisfiedWait(cursor, count)) {
+            cursor += count;
+            submission.rewindTail = guest + cursor;
+            submission.rewindWords = words - cursor;
+            submission.rewindAfterWait = true;
+            std::copy(guest + cursor - count, guest + cursor, submission.deferredWait.begin());
+            static const bool snapshotTails = std::getenv("APS5_DUMP_REJECTED") != nullptr;
+            if (snapshotTails) submission.tailAtSubmit = std::make_shared<std::vector<std::uint32_t>>(guest + cursor, guest + words);
+            return true;
+        }
         cursor += count;
         if (opcode == 0x59u) {
             require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
@@ -324,7 +373,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     static const bool ring = ReadSubmissionRingSettings();
     if (ring) PrepareSubmissionRing(stalled.queue);
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
-    if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
+    if (!stalled.rewindAfterWait && (control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
         struct BlockedWait {
             Driver& driver;
@@ -352,9 +401,83 @@ void Driver::executeRewindTail(const Submission& stalled) {
         released.clear();
         tail.enqueuedAt = std::chrono::steady_clock::now();
     }
+    if (stalled.rewindAfterWait) {
+        const std::span<const std::uint32_t> waitPacket(stalled.deferredWait);
+        const auto wait = Pm4::DecodeWait(waitPacket);
+        const auto readWait = [&]() -> std::uint64_t {
+            if (wait.bytes == 8) return std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(wait.address))).load(std::memory_order_acquire);
+            return std::atomic_ref<const std::uint32_t>(*reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(wait.address))).load(std::memory_order_acquire);
+        };
+        const auto atEntry = readWait();
+        const bool held = Pm4::WaitComparesValue(waitPacket, atEntry);
+        const auto waitStart = std::chrono::steady_clock::now();
+        recordQueuedLabelsBeforeRead(stalled.queue);
+        if (!held) {
+            noteWaitBlocked(stalled.queue, wait.address, true);
+            struct BlockedWait {
+                Driver& driver;
+                std::uint32_t queue;
+                ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
+            } blocked{*this, stalled.queue};
+            StallWatch stall(stalled.queue);
+            while (!Pm4::WaitComparesValue(waitPacket, readWait())) {
+                CheckFailure();
+                checkStopping();
+                noteAwaitingTitle(stalled.queue, wait.address);
+                stall.Check("WAIT_REG_MEM before a deferred tail at", wait.address);
+                if (stalled.queue == 0 && completionsPending()) reapCompletionLabels();
+                PollSleep();
+            }
+        }
+        static std::atomic<int> logged{0};
+        static std::atomic<int> early{0};
+        if (!held) early.fetch_add(1, std::memory_order_relaxed);
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 30 || (!held && early.load(std::memory_order_relaxed) <= 30)) {
+            const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+            std::fprintf(stderr, "[wait-tail] queue 0x%x serial %llu: tail 0x%llx+%zu dwords; wait 0x%llx function %u reference 0x%llx: guest value 0x%llx at entry (%s), waited %.2f ms (%d early so far)\n", stalled.queue, static_cast<unsigned long long>(stalled.serial), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(stalled.rewindTail)), stalled.rewindWords, static_cast<unsigned long long>(wait.address), wait.function, static_cast<unsigned long long>(wait.reference), static_cast<unsigned long long>(atEntry), held ? "held" : "not held", waitedMs, early.load(std::memory_order_relaxed));
+        }
+        {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            Graphics::FinishLeaseWork();
+        }
+        std::vector<std::byte> landed(stalled.rewindWords * sizeof(std::uint32_t));
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::IndirectArguments);
+        GuestMemory::Read(reinterpret_cast<std::uint64_t>(stalled.rewindTail), landed, alignof(std::uint32_t));
+    }
     copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
     if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
-    validate(tail, stalled.rewindTail);
+    try {
+        validate(tail, stalled.rewindTail);
+    } catch (...) {
+        if (stalled.tailAtSubmit != nullptr) {
+            const auto& before = *stalled.tailAtSubmit;
+            std::size_t changed = 0, first = before.size(), last = 0;
+            for (std::size_t i = 0; i < before.size() && i < tail.commands.size(); ++i) {
+                if (before[i] == tail.commands[i]) continue;
+                ++changed;
+                first = std::min(first, i);
+                last = i;
+            }
+            std::fprintf(stderr, "[torn] queue 0x%x serial %llu: between the head's submit and the tail copy %zu of %zu tail dwords changed (first %zu, last %zu)\n", stalled.queue, static_cast<unsigned long long>(stalled.serial), changed, before.size(), changed == 0 ? 0 : first, last);
+            if (FILE* file = std::fopen("rejected_tail_at_submit.bin", "wb")) {
+                std::fwrite(before.data(), sizeof(std::uint32_t), before.size(), file);
+                std::fclose(file);
+            }
+        }
+        throw;
+    }
+    if (stalled.rewindAfterWait && stalled.queue == 0x52) {
+        static std::atomic<int> dumped{0};
+        if (const int index = dumped.fetch_add(1, std::memory_order_relaxed); index < 12) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "good_tail_%02d_q52.bin", index);
+            if (FILE* file = std::fopen(name, "wb")) {
+                std::fwrite(tail.commands.data(), sizeof(std::uint32_t), tail.commands.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
     readRegisterLists(tail);
     if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(tail);

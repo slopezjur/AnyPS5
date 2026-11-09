@@ -781,7 +781,7 @@ void Driver::execute(const Submission& submission) {
             deferCompletion(submission);
             return;
         }
-        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
+        if (submission.rewindAfterWait || (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
             DrawPipeline::Queue0().Enqueue([this, progress = submission.progress] {
                 submitOpenWork(progress);
                 wakeQueueZeroForCompletions();

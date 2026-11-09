@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -166,7 +167,17 @@ private:
 }
 #endif
 
+namespace {
+
+std::recursive_mutex& allocationLock(const CommandBuffer* buffer) {
+    static std::array<std::recursive_mutex, 64> locks;
+    return locks[(reinterpret_cast<std::uintptr_t>(buffer) >> 4u) % locks.size()];
+}
+
+}
+
 std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function) {
+    const std::lock_guard serialized(allocationLock(buffer));
 #if defined(__linux__) || defined(_WIN32)
     const CommandBufferRaceGuard guard(buffer, function);
 #endif

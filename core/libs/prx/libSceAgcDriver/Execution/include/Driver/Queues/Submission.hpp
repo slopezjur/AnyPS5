@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionProgress.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -46,7 +47,12 @@ struct Submission {
     std::chrono::steady_clock::time_point orderedAt{};
     const std::uint32_t* rewindTail = nullptr;
     std::size_t rewindWords = 0;
+    bool rewindAfterWait = false;
+    std::array<std::uint32_t, 7> deferredWait{};
+    std::shared_ptr<std::vector<std::uint32_t>> tailAtSubmit;
 };
+
+std::atomic<std::uint64_t>& DeferredWaitAddress();
 
 struct QueueWorker {
     std::deque<Submission> pending;

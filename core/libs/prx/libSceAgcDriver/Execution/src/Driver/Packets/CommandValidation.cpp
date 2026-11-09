@@ -1,10 +1,18 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
+
+std::atomic<std::uint64_t>& DeferredWaitAddress() {
+    static std::atomic<std::uint64_t> address{0};
+    return address;
+}
 
 void Driver::dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest) {
     std::map<std::string, std::pair<std::size_t, std::string>> summary;
@@ -63,6 +71,62 @@ void Driver::validate(const Submission& submission, const std::uint32_t* guest) 
             std::fprintf(stderr, "[gpu] dwords %zu..%zu:", cursor >= 8 ? cursor - 8 : 0, std::min(commands.size(), cursor + 8));
             for (std::size_t i = cursor >= 8 ? cursor - 8 : 0; i < std::min(commands.size(), cursor + 8); ++i) std::fprintf(stderr, " %08x", commands[i]);
             std::fprintf(stderr, "\n");
+            if (guest != nullptr) {
+                std::size_t firstWait = commands.size();
+                for (std::size_t at = 0; at < cursor;) {
+                    const auto word = commands[at];
+                    if (Pm4::FillerPacket(word)) { ++at; continue; }
+                    if (((word >> 8u) & 0xffu) == 0x3cu && firstWait == commands.size()) firstWait = at;
+                    at += Pm4::PacketWords(word);
+                }
+                const auto waitAddress = DeferredWaitAddress().load(std::memory_order_acquire);
+                const auto waitWord = [&]() -> std::uint64_t {
+                    if (waitAddress == 0) return 0;
+                    return std::atomic_ref<const std::uint32_t>(*reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(waitAddress))).load(std::memory_order_acquire);
+                };
+                const auto start = std::chrono::steady_clock::now();
+                std::size_t lastChanged = ~std::size_t{0};
+                std::size_t lastValid = ~std::size_t{0};
+                std::uint64_t lastWord = ~std::uint64_t{0};
+                int reports = 0;
+                bool becameValid = false;
+                while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10000) && reports < 40) {
+                    std::size_t changed = 0;
+                    std::size_t firstChanged = commands.size();
+                    for (std::size_t i = 0; i < commands.size(); ++i) {
+                        const auto now = std::atomic_ref<const std::uint32_t>(guest[i]).load(std::memory_order_acquire);
+                        if (now != commands[i]) {
+                            ++changed;
+                            firstChanged = std::min(firstChanged, i);
+                        }
+                    }
+                    std::size_t valid = 0;
+                    for (std::size_t at = 0; at < commands.size();) {
+                        const auto word = std::atomic_ref<const std::uint32_t>(guest[at]).load(std::memory_order_acquire);
+                        if (Pm4::FillerPacket(word)) { ++at; continue; }
+                        if ((word & 0xc0000000u) != 0xc0000000u) break;
+                        const auto words = Pm4::PacketWords(word);
+                        if (words == 0 || words > commands.size() - at) break;
+                        at += words;
+                        valid = at;
+                    }
+                    const auto word = waitWord();
+                    if (changed != lastChanged || valid != lastValid || word != lastWord) {
+                        const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                        std::fprintf(stderr, "[torn] queue 0x%x t=%.1f ms: %zu of %zu dwords changed (first at %zu), packets parse to dword %zu, wait word 0x%llx at 0x%llx; first WAIT_REG_MEM at dword %zu\n", queue, elapsed, changed, commands.size(), firstChanged, valid, static_cast<unsigned long long>(word), static_cast<unsigned long long>(waitAddress), firstWait);
+                        lastChanged = changed;
+                        lastValid = valid;
+                        lastWord = word;
+                        ++reports;
+                    }
+                    if (valid == commands.size()) {
+                        becameValid = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+                std::fprintf(stderr, "[torn] queue 0x%x: %s within 3 s\n", queue, becameValid ? "the guest buffer became a valid packet stream" : "the guest buffer never became a valid packet stream");
+            }
             throw std::runtime_error(std::string("AGC driver: ") + what);
         }
         const auto count = Pm4::PacketWords(header);
