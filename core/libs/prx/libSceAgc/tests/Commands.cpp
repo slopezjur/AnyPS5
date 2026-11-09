@@ -540,16 +540,30 @@ void testMemory() {
         waitPacket[6] |= lowMask;
         waitPacket[7] = 0xa5fc0000u;
         const auto tag = waitPacket[2] & 0xffff0000u;
-        const std::uintptr_t address = 0x1236abcd12345679ull;
+        const std::uintptr_t address = 0x123456789ab8ull;
         check(sceAgcWaitRegMemPatchAddress(waitPacket, reinterpret_cast<const volatile void*>(address)) == 0, "wait address patch failed");
-        check(waitPacket[2] == (tag | 0xabcdu) && waitPacket[3] == 0x12345679u, "wait wrapper address patch mismatch");
-        check(waitPacket[6] == ((0x12345679u & ~lowMask) | lowMask) && waitPacket[7] == 0xa5feabcdu, "wait address patch did not preserve control bits");
-        for (std::uint32_t comparison = 0; comparison <= 255; ++comparison) {
+        check(waitPacket[2] == (tag | 0x1234u) && waitPacket[3] == 0x56789ab8u, "wait wrapper address patch mismatch");
+        check(waitPacket[6] == ((0x56789ab8u & ~lowMask) | lowMask) && waitPacket[7] == 0xa5fc1234u, "wait address patch did not preserve control bits");
+        for (std::uint32_t comparison = 0; comparison <= 6; ++comparison) {
             const auto control = waitPacket[5] & ~7u;
             check(sceAgcWaitRegMemPatchCompareFunction(waitPacket, static_cast<std::uint8_t>(comparison)) == 0, "wait comparison patch failed");
-            check(waitPacket[5] == (control | (comparison & 7u)), "wait comparison patch changed control bits");
+            check(waitPacket[5] == (control | comparison), "wait comparison patch changed control bits");
         }
+        const auto beforeComparison = storage.words;
+        for (std::uint32_t comparison = 7; comparison <= 255; ++comparison) {
+            expectFailure([&] { sceAgcWaitRegMemPatchCompareFunction(waitPacket, static_cast<std::uint8_t>(comparison)); });
+        }
+        check(storage.words == beforeComparison, "a rejected wait comparison patch modified packet memory");
     }
+    const auto beforeAddress = storage.words;
+    expectFailure([&] { sceAgcWaitRegMemPatchAddress(packet, reinterpret_cast<const volatile void*>(std::uintptr_t{0x123456789ab4u})); });
+    expectFailure([&] { sceAgcWaitRegMemPatchAddress(truncated, reinterpret_cast<const volatile void*>(std::uintptr_t{0x123456789ab2u})); });
+    check(storage.words == beforeAddress, "a misaligned wait address patch modified packet memory");
+    check(sceAgcWaitRegMemPatchAddress(truncated, reinterpret_cast<const volatile void*>(std::uintptr_t{0x123456789ab4u})) == 0 && truncated[3] == 0x56789ab4u, "32-bit wait rejected a 4-byte aligned address");
+    const auto beforeWideAddress = storage.words;
+    expectFailure([&] { sceAgcWaitRegMemPatchAddress(packet, reinterpret_cast<const volatile void*>(std::uintptr_t{0x1000000000008u})); });
+    expectFailure([&] { sceAgcWaitRegMemPatchAddress(truncated, reinterpret_cast<const volatile void*>(std::uintptr_t{0x1000000000004u})); });
+    check(storage.words == beforeWideAddress, "a wait address above 48 bits modified packet memory");
     const auto beforeMask = storage.words;
     expectFailure([&] { sceAgcWaitRegMemPatchMask(packet + 4, 1); });
     check(storage.words == beforeMask, "invalid mask patch modified packet memory");

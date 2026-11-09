@@ -119,6 +119,12 @@ void expectFailure(TAction action, std::string_view reason) {
     throw std::runtime_error("expected graphics rejection: " + std::string(reason));
 }
 
+ShaderRecompiler::TargetMerge singleTargetMerge(const AgcDriver::Graphics::State& state) {
+    const auto merges = AgcDriver::Graphics::ExportTargetMerges(state);
+    Require(merges.size() <= 1u, "a single-target state exported more than one target merge");
+    return merges.empty() ? ShaderRecompiler::TargetMerge{} : merges.front();
+}
+
 void inactiveVertexPointSizeTests() {
     const auto pointSizeState = [] {
         auto queue = makeState();
@@ -1782,14 +1788,23 @@ void UnclampedNormalizedColorTests() {
     const auto pass = AgcDriver::Graphics::DecodeColorMetadataPass(eliminate);
     Require(pass.has_value() && pass->mode == AgcDriver::Graphics::ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1 && pass->targets[0].format == VK_FORMAT_R8G8_UNORM, "a fast-clear eliminate over an unclamped UNORM target was refused");
     queue.context[0x1e0] = blending;
-    expectFailure([&] { DecodeState(queue); }, "blending unclamped normalized color is not implemented (CB_COLOR_INFO 0x0000000c, CB_BLEND0_CONTROL 0x40000504)");
+    state = DecodeState(queue);
+    Require(state.colors.at(0).partialWriteMask == AgcDriver::Graphics::UnclampedBlendMask && state.blends.at(0).blendEnable && state.blends.at(0).colorWriteMask != 0, "an 8_8 UNORM target that blends with BLEND_CLAMP clear (CB_COLOR_INFO 0x0000000c, CB_BLEND0_CONTROL 0x40000504) was not routed to the pixel shader");
+    const auto merge = AgcDriver::Graphics::ExportTargetMerges(state).at(0);
+    Require(merge.blend.enabled && !merge.blend.snorm && merge.mask == AgcDriver::Graphics::UnclampedBlendMask && merge.samples == 1u && merge.blend.colorSource == VK_BLEND_FACTOR_SRC_ALPHA && merge.blend.colorDestination == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA && merge.blend.colorOperation == VK_BLEND_OP_ADD && merge.blend.writeMask == state.blends.at(0).colorWriteMask, "the unclamped blend of an 8_8 UNORM target was not described to the pixel shader");
     queue.context[0x31c] |= 0x10000u;
     state = DecodeState(queue);
     Require(!state.blends.at(0).blendEnable && state.blends.at(0).colorWriteMask != 0, "an unclamped UNORM target with BLEND_BYPASS was refused or blended");
     queue = target(0x0000010cu);
     Require(DecodeState(queue).colors.at(0).format == VK_FORMAT_R8G8_SNORM, "an unclamped SNORM target that does not blend was refused");
     queue.context[0x1e0] = blending;
-    expectFailure([&] { DecodeState(queue); }, "blending unclamped normalized color is not implemented");
+    state = DecodeState(queue);
+    Require(state.colors.at(0).partialWriteMask == AgcDriver::Graphics::UnclampedBlendMask && AgcDriver::Graphics::ExportTargetMerges(state).at(0).blend.snorm, "an unclamped SNORM target that blends was not routed to the pixel shader as signed");
+    auto unsignedMasked = target(0x0000000cu);
+    unsignedMasked.context[0x1e0] = blending;
+    unsignedMasked.context[0x8e] = 0x1u;
+    state = DecodeState(unsignedMasked);
+    Require(state.colors.at(0).partialWriteMask == AgcDriver::Graphics::UnclampedBlendMask && state.blends.at(0).colorWriteMask == VK_COLOR_COMPONENT_R_BIT, "an unclamped UNORM target that blends with a write mask that skips a component was not routed to the pixel shader");
     queue = target(0x00000604u);
     expectFailure([&] { DecodeState(queue); }, "unclamped normalized color is unsupported");
     queue = target(0x0000800cu);
@@ -10501,14 +10516,14 @@ void unorm4_4_4_4TargetTests() {
     Require(state.color.format == VK_FORMAT_R16_UINT && state.color.elementBytes == 2 && state.color.componentMapping == 0x1bu && state.color.packing == ColorExportPacking::Unorm4_4_4_4, "a 4_4_4_4 unorm target did not decode to an R16_UINT attachment with reversed exports");
     const auto packings = AgcDriver::Graphics::ExportPackings(state);
     Require(packings[0] == ColorExportPacking::Unorm4_4_4_4 && std::all_of(packings.begin() + 1, packings.end(), [](ColorExportPacking packing) { return packing == ColorExportPacking::None; }), "export 0 did not carry the 4_4_4_4 unorm packing");
-    Require(state.color.partialWriteMask == 0u && state.blends[0].colorWriteMask == 0xfu && AgcDriver::Graphics::ExportTargetMerge(state).mask == 0u, "a full write of a 4_4_4_4 unorm target merged into the target");
+    Require(state.color.partialWriteMask == 0u && state.blends[0].colorWriteMask == 0xfu && singleTargetMerge(state).mask == 0u, "a full write of a 4_4_4_4 unorm target merged into the target");
     auto changed = queue;
     for (const auto& [targetMask, wordMask] : {std::pair{1u, 0xf000u}, std::pair{7u, 0xfff0u}, std::pair{8u, 0x000fu}, std::pair{0xau, 0x0f0fu}}) {
         changed.context[0x8e] = targetMask;
         Require(AgcDriver::Graphics::DrawRejection(changed, false).empty(), "the draw precheck refused CB_TARGET_MASK " + std::to_string(targetMask) + " of a 4_4_4_4 unorm target");
         const auto partial = AgcDriver::Graphics::DecodeState(changed);
         Require(partial.color.partialWriteMask == wordMask && partial.colors.front().partialWriteMask == wordMask && partial.blends[0].colorWriteMask == 0u && partial.blend.colorWriteMask == 0u, "CB_TARGET_MASK " + std::to_string(targetMask) + " of a 4_4_4_4 unorm target did not merge its nibbles behind a closed write mask");
-        const auto merge = AgcDriver::Graphics::ExportTargetMerge(partial);
+        const auto merge = singleTargetMerge(partial);
         const auto expected = AgcDriver::Graphics::SurfaceForTarget(partial.color);
         const auto surface = AgcDriver::Graphics::DecodeTextureResource(merge.descriptor);
         Require(merge.target == 0u && merge.mask == wordMask && merge.samples == 1u && !merge.depthStencilWrites && surface.baseAddress == expected.baseAddress && surface.pipeBankXor == expected.pipeBankXor && surface.width == expected.width && surface.height == expected.height && surface.format == expected.format && surface.tileMode == expected.tileMode && surface.dimension == AgcDriver::Graphics::TextureDimension::k2D && surface.mipCount == 1u && surface.samples == 1u, "the merge descriptor of CB_TARGET_MASK " + std::to_string(targetMask) + " does not decode to the target's surface");
@@ -10542,7 +10557,7 @@ void unorm4_4_4_4TargetTests() {
             const auto what = "DB_DEPTH_CONTROL " + std::to_string(control) + " with stencil operations " + std::to_string(ops) + " and masks " + std::to_string(masks);
             Require(AgcDriver::Graphics::DrawRejection(depthQueue, false).empty(), "the draw precheck refused a partial 4_4_4_4 write under " + what);
             const auto partial = AgcDriver::Graphics::DecodeState(depthQueue);
-            const auto merge = AgcDriver::Graphics::ExportTargetMerge(partial);
+            const auto merge = singleTargetMerge(partial);
             Require(partial.depth.has_value() == ((control & 0xbu) != 0u) && partial.depthBoundsTest == ((control & 8u) != 0u) && merge.mask == 0xf000u && AgcDriver::Graphics::DepthStencilWrites(partial) == writes && merge.depthStencilWrites == writes && merge.depthStencilTests == ((control & 0xbu) != 0u), "a partial 4_4_4_4 write under " + what + (writes ? " did not report" : " reported") + " depth or stencil writes");
         }
         auto truncated = depthQueue;
@@ -10582,16 +10597,16 @@ void unorm4_4_4_4TargetTests() {
         Require(killState.pixelKill && !killState.pixelEarlyZ && !earlyState.pixelKill && earlyState.pixelEarlyZ, "DB_SHADER_CONTROL.KILL_ENABLE of a 4_4_4_4 merge did not decode as a kill under late tests");
         constexpr std::array<std::uint32_t, 3> mergeCode{0xf800180fu, 0x07060504u, 0xbf810000u};
         auto merging = packedExportRequest(changed, partial, mergeCode);
-        merging.context.pixel->targetMerge = AgcDriver::Graphics::ExportTargetMerge(partial);
+        merging.context.pixel->targetMerges = {singleTargetMerge(partial)};
         const std::array<std::uint32_t, 3> capabilities{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityStorageImageReadWithoutFormat};
         merging.target.supportedCapabilities = capabilities;
         merging.target.registrationWordLimit = 1u << 20u;
         const ShaderRecompiler::RequestSerializer mergeSerializer;
-        Require(mergeSerializer.Deserialize(mergeSerializer.Serialize(merging)).request.context.pixel->targetMerge == merging.context.pixel->targetMerge, "the 4_4_4_4 target merge was lost in serialization");
+        Require(mergeSerializer.Deserialize(mergeSerializer.Serialize(merging)).request.context.pixel->targetMerges == merging.context.pixel->targetMerges, "the 4_4_4_4 target merge was lost in serialization");
         auto unmerged = merging;
-        unmerged.context.pixel->targetMerge = {};
+        unmerged.context.pixel->targetMerges = {};
         auto moved = merging;
-        moved.context.pixel->targetMerge.descriptor[0] += 0x100u;
+        moved.context.pixel->targetMerges.front().descriptor[0] += 0x100u;
         std::vector<std::uint64_t> mergedKey, unmergedKey, movedKey;
         ShaderRecompiler::RecompileCacheKey::BuildInterface(merging, mergedKey);
         ShaderRecompiler::RecompileCacheKey::BuildInterface(unmerged, unmergedKey);
@@ -10612,7 +10627,7 @@ void unorm4_4_4_4TargetTests() {
             const auto bound = std::ranges::any_of(merged.bindings, [&](const ShaderRecompiler::DescriptorBinding& binding) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) return false;
                 for (std::size_t offset = 0; offset + 8u <= binding.guestDescriptor.size(); offset += 8u) {
-                    if (std::equal(merging.context.pixel->targetMerge.descriptor.begin(), merging.context.pixel->targetMerge.descriptor.end(), binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(offset))) return true;
+                    if (std::equal(merging.context.pixel->targetMerges.front().descriptor.begin(), merging.context.pixel->targetMerges.front().descriptor.end(), binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(offset))) return true;
                 }
                 return false;
             });
@@ -10644,7 +10659,7 @@ void unorm4_4_4_4TargetTests() {
             }
             Require(reads == 1u && writes == 1u && interlockShape(words) == "capability extension ordered begin end " && declaresEarlyFragmentTests(killing), "a killing 4_4_4_4 merge module under late tests of a draw without depth or stencil writes did not merge inside a pixel interlock after early tests");
         }
-        killing.context.pixel->targetMerge.depthStencilWrites = true;
+        killing.context.pixel->targetMerges.front().depthStencilWrites = true;
         expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(killing)); }, "kills pixels under late tests of a draw writing depth or stencil");
         auto earlyKilling = killing;
         earlyKilling.context.pixel->earlyZ = true;
@@ -10657,7 +10672,7 @@ void unorm4_4_4_4TargetTests() {
         constexpr std::array<std::uint32_t, 6> countingCode{0x7e000281u, 0xe0c80000u, 0x80000000u, 0xf800180fu, 0x07060504u, 0xbf810000u};
         auto counting = packedExportRequest(changed, partial, countingCode);
         counting.context.userData = counter;
-        counting.context.pixel->targetMerge = merging.context.pixel->targetMerge;
+        counting.context.pixel->targetMerges = merging.context.pixel->targetMerges;
         counting.target = merging.target;
         counting.target.registrationModules = false;
         counting.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
@@ -10665,7 +10680,7 @@ void unorm4_4_4_4TargetTests() {
         counting.target.supportedCapabilities = atomicCapabilities;
         counting.context.pixel->earlyZ = false;
         static_cast<void>(ShaderRecompiler::Recompile(counting));
-        counting.context.pixel->targetMerge.depthStencilTests = true;
+        counting.context.pixel->targetMerges.front().depthStencilTests = true;
         expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(counting)); }, "writes guest memory (stores, atomics or GDS) under late tests");
         counting.context.pixel->earlyZ = true;
         const auto earlyWords = ShaderRecompiler::Recompile(counting).spirv.Copy();
@@ -10674,7 +10689,7 @@ void unorm4_4_4_4TargetTests() {
         Require(atomics == 1u && interlockShape(earlyWords) == "capability extension ordered begin end " && declaresEarlyFragmentTests(counting), "a 4_4_4_4 merge whose shader adds to a counter under early tests did not keep its one atomic add beside the merge");
         constexpr std::array<std::uint32_t, 9> gdsReadCode{0xbefc03ffu, 0x00000100u, 0x7e000280u, 0xd8da0000u, 0x04000000u, 0xbf8c0000u, 0xf800180fu, 0x07060504u, 0xbf810000u};
         auto gdsReading = packedExportRequest(changed, partial, gdsReadCode);
-        gdsReading.context.pixel->targetMerge = counting.context.pixel->targetMerge;
+        gdsReading.context.pixel->targetMerges = counting.context.pixel->targetMerges;
         gdsReading.context.pixel->earlyZ = false;
         gdsReading.target = counting.target;
         static_cast<void>(ShaderRecompiler::Recompile(gdsReading));
@@ -10684,7 +10699,7 @@ void unorm4_4_4_4TargetTests() {
         expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(gdsAdding)); }, "writes guest memory (stores, atomics or GDS) under late tests");
         auto lateMerge = counting;
         lateMerge.context.pixel->earlyZ = false;
-        lateMerge.context.pixel->targetMerge = {};
+        lateMerge.context.pixel->targetMerges = {};
         static_cast<void>(ShaderRecompiler::Recompile(lateMerge));
     }
     changed = queue;
@@ -10729,15 +10744,15 @@ void unorm4_4_4_4TargetTests() {
         for (const auto& [inputs, position, what] : {InputCase{0x0302u, 0u, "POS_X_FLOAT and POS_Y_FLOAT at the centre"}, InputCase{0x0302u, 0x100000u, "POS_X_FLOAT and POS_Y_FLOAT at the upper-left corner"}, InputCase{0x9022u, 0u, "PERSP_CENTER, LINEAR_CENTER, FRONT_FACE and POS_FIXED_PT"}}) {
             Require(AgcDriver::Graphics::DecodeState(inputState(rasterized, inputs, position)).perSampleShading, std::string("a partial write of a 2-sample 4_4_4_4 unorm target whose pixel-rate shader reads ") + what + " was refused");
         }
-        const auto merge = AgcDriver::Graphics::ExportTargetMerge(multisampled);
+        const auto merge = singleTargetMerge(multisampled);
         const auto surface = AgcDriver::Graphics::DecodeTextureResource(merge.descriptor);
         Require(merge.samples == 2u && merge.mask == 0xf000u && surface.dimension == AgcDriver::Graphics::TextureDimension::k2DMsaa && surface.samples == 2u && surface.baseAddress == multisampled.color.surfaceAddress && surface.width == multisampled.color.extent.width && surface.height == multisampled.color.extent.height && surface.format == AgcDriver::Graphics::TargetMergeSurface(multisampled.color).format, "the merge descriptor of a 2-sample 4_4_4_4 unorm target does not decode to its multisampled surface");
         auto unshaded = multisampled;
         unshaded.perSampleShading = false;
-        expectFailure([&] { static_cast<void>(AgcDriver::Graphics::ExportTargetMerge(unshaded)); }, "needs per-sample shading");
+        expectFailure([&] { static_cast<void>(singleTargetMerge(unshaded)); }, "needs per-sample shading");
         constexpr std::array<std::uint32_t, 3> mergeCode{0xf800180fu, 0x07060504u, 0xbf810000u};
         auto merging = packedExportRequest(changed, multisampled, mergeCode);
-        merging.context.pixel->targetMerge = merge;
+        merging.context.pixel->targetMerges = {merge};
         const std::array<std::uint32_t, 5> capabilities{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityStorageImageReadWithoutFormat, spv::CapabilityStorageImageMultisample, spv::CapabilityInterpolationFunction};
         merging.target.supportedCapabilities = capabilities;
         merging.target.fragmentShaderBarycentricEnabled = true;
@@ -10762,7 +10777,7 @@ void unorm4_4_4_4TargetTests() {
         static_cast<void>(ShaderRecompiler::Recompile(centred));
         const auto rasterizedState = AgcDriver::Graphics::DecodeState(rasterized);
         auto offCentre = packedExportRequest(rasterized, rasterizedState, mergeCode);
-        offCentre.context.pixel->targetMerge = AgcDriver::Graphics::ExportTargetMerge(rasterizedState);
+        offCentre.context.pixel->targetMerges = {singleTargetMerge(rasterizedState)};
         offCentre.context.pixel->iteratesSamples = rasterizedState.perSampleShading;
         offCentre.context.pixel->sampleLocations = AgcDriver::Graphics::PixelSampleLocations(rasterizedState, *offCentre.context.pixel);
         Require(std::ranges::any_of(offCentre.context.pixel->sampleLocations, [](std::uint8_t location) { return location != 0u; }), "a 2-sample rasterizer's merge did not pass its off-centre sample locations");
@@ -10776,7 +10791,7 @@ void unorm4_4_4_4TargetTests() {
         constexpr std::array<std::uint32_t, 6> countingCode{0x7e000281u, 0xe0c80000u, 0x80000000u, 0xf800180fu, 0x07060504u, 0xbf810000u};
         auto counting = packedExportRequest(changed, multisampled, countingCode);
         counting.context.userData = counter;
-        counting.context.pixel->targetMerge = merge;
+        counting.context.pixel->targetMerges = {merge};
         counting.context.pixel->iteratesSamples = true;
         counting.context.pixel->earlyZ = true;
         counting.target = merging.target;
@@ -10785,7 +10800,7 @@ void unorm4_4_4_4TargetTests() {
         counting.target.supportedCapabilities = atomicCapabilities;
         expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(counting)); }, "each covered sample would repeat its writes");
         auto unmergedCounting = counting;
-        unmergedCounting.context.pixel->targetMerge = {};
+        unmergedCounting.context.pixel->targetMerges = {};
         static_cast<void>(ShaderRecompiler::Recompile(unmergedCounting));
     }
     for (const auto& [number, swap] : {std::pair{1u, 2u}, std::pair{4u, 2u}, std::pair{0u, 0u}, std::pair{0u, 1u}, std::pair{0u, 3u}}) {
@@ -10851,7 +10866,7 @@ void float11_11_10TargetTests() {
     for (std::uint32_t i = 0; i < 4; ++i) changed.context[0x105 + i] = 0;
     const auto additive = AgcDriver::Graphics::DecodeState(changed);
     Require(additive.color.mergeBlend == 0x40000101u && additive.color.partialWriteMask == 0xffffffffu && !additive.blends[0].blendEnable && additive.blends[0].colorWriteMask == 0u, "an additive blend into an 11_11_10 float target did not decode as a blending merge of the whole word");
-    const auto additiveMerge = AgcDriver::Graphics::ExportTargetMerge(additive);
+    const auto additiveMerge = singleTargetMerge(additive);
     Require(additiveMerge.mask == 0xffffffffu && additiveMerge.packing == ColorExportPacking::Float11_11_10 && additiveMerge.blendControl == 0x40000101u, "the additive 11_11_10 float blend did not reach the pixel shader's target merge");
     changed.context[0x1e0] = 0x65040504u;
     Require(AgcDriver::Graphics::DecodeState(changed).color.mergeBlend == 0x40000504u, "a source-over blend into an 11_11_10 float target did not keep its color equation");
