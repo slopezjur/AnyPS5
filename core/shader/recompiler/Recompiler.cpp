@@ -1708,6 +1708,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             if (loaded.artifact.bindlessHeap) ResourceMaterializer::RegisterBindlessInterfaces(loaded.info.info, loaded.info.stage);
             loaded.artifact.variantId = nextVariantId();
             attachSubstitutes(loaded);
+            if (loaded.artifact.spirv.Mapped()) ShaderDiskCache::ReleaseMapped(loaded.artifact.spirv.Words());
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
     }

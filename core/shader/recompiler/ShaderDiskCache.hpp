@@ -76,6 +76,7 @@ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan>
 void Flush();
 
 [[nodiscard]] std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::uint32_t> genericSpirv, std::size_t slots);
+void ReleaseMapped(std::span<const std::uint32_t> words) noexcept;
 void Shutdown();
 [[nodiscard]] unsigned Writers();
 [[nodiscard]] Counters Totals();
