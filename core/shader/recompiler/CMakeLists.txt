@@ -315,6 +315,7 @@ function(add_shader_recompiler target runtimeTarget)
             ThreadOwned
             ProgramRole
             UnresolvableSwappcTarget
+            DecodeRdnaProgram
             ValidateAndOptimizeSpirv
             FindUserDataCalls
             UserDataCalleeLength

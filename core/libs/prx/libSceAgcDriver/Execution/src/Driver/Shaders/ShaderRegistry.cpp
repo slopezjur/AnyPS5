@@ -1486,6 +1486,8 @@ struct RegisteredPreparation {
     std::shared_ptr<VulkanDevice> prebuildDevice;
 };
 
+constexpr std::size_t ScratchInstructionLimit = 32768;
+
 std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto header = ReadHeader(snapshot);
@@ -1522,10 +1524,18 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     auto plan = std::make_unique<RegisteredPreparation>();
     plan->codeOffset = codeOffset;
-    ShaderRecompiler::RdnaProgram decoded;
+    thread_local ShaderRecompiler::RdnaProgram scratch;
+    struct ScratchRelease {
+        ShaderRecompiler::RdnaProgram& program;
+        ~ScratchRelease() {
+            program.code = {};
+            if (program.instructions.capacity() > ScratchInstructionLimit) program.instructions = {};
+        }
+    } release{scratch};
+    auto& decoded = scratch;
     plan->registration = registration;
     try {
-        decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        ShaderRecompiler::DecodeRdnaProgram(code, decoded);
     } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
         if (deferred == nullptr) throw;
         return defer(error.what());
