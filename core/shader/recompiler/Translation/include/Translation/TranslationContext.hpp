@@ -28,6 +28,8 @@ public:
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
+    void SetVectorWindowActive(bool active) { ir.SetVectorWindowActive(active); }
+    void SyncVectorWindow(bool toWindow) { ir.SyncVectorWindow(toWindow); }
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
     void TranslateUnlinkedCall(const RdnaInstruction& instruction);
 
