@@ -17,6 +17,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
+#include "ShaderCacheDirectory.hpp"
+#include "ShaderDiskCache.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -33,6 +35,8 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -56,6 +60,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -1488,6 +1493,99 @@ struct RegisteredPreparation {
 
 constexpr std::size_t ScratchInstructionLimit = 32768;
 
+struct FactsKey {
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+
+    bool operator==(const FactsKey&) const = default;
+};
+
+struct FactsKeyHash {
+    std::size_t operator()(const FactsKey& key) const noexcept { return static_cast<std::size_t>(key.low ^ key.high); }
+};
+
+class RegistrationFacts {
+public:
+    static RegistrationFacts& Instance() {
+        static auto* const facts = new RegistrationFacts;
+        return *facts;
+    }
+
+    std::optional<std::uint64_t> Find(const FactsKey& key) {
+        std::lock_guard lock(mutex);
+        load();
+        const auto found = facts.find(key);
+        return found != facts.end() ? std::optional(found->second) : std::nullopt;
+    }
+
+    void Store(const FactsKey& key, std::uint64_t value) {
+        std::lock_guard lock(mutex);
+        load();
+        const auto [entry, added] = facts.try_emplace(key, value);
+        if (!added && entry->second == value) return;
+        entry->second = value;
+        if (!file.is_open()) return;
+        Record record{key.low, key.high, value, 0};
+        record.check = checkOf(record);
+        file.write(reinterpret_cast<const char*>(&record), sizeof(record));
+        if (++unflushed < FlushEvery) return;
+        file.flush();
+        unflushed = 0;
+    }
+
+private:
+    struct Record {
+        std::uint64_t low;
+        std::uint64_t high;
+        std::uint64_t value;
+        std::uint64_t check;
+    };
+
+    static constexpr std::uint32_t FlushEvery = 64;
+
+    static std::uint64_t checkOf(const Record& record) {
+        const std::array<std::uint64_t, 3> words{record.low, record.high, record.value};
+        return ShaderRecompiler::HashBytes(std::as_bytes(std::span(words)), 0x7265676661637473ull);
+    }
+
+    void load() {
+        if (loaded) return;
+        loaded = true;
+        if (!ShaderRecompiler::ShaderDiskCache::Enabled()) return;
+        const auto directory = ShaderRecompiler::ShaderDiskCache::EntryDirectory();
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        const auto path = directory / "registration-facts.bin";
+        const auto stored = std::filesystem::file_size(path, error);
+        if (!error && stored % sizeof(Record) != 0) std::filesystem::resize_file(path, stored - stored % sizeof(Record), error);
+        if (std::ifstream input(path, std::ios::binary); input) {
+            Record record;
+            while (input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+                if (record.check == checkOf(record)) facts.insert_or_assign(FactsKey{record.low, record.high}, record.value);
+            }
+        }
+        file.open(path, std::ios::binary | std::ios::app);
+    }
+
+    std::mutex mutex;
+    std::unordered_map<FactsKey, std::uint64_t, FactsKeyHash> facts;
+    std::ofstream file;
+    std::uint32_t unflushed = 0;
+    bool loaded = false;
+};
+
+FactsKey CodeFactsKey(std::span<const std::uint32_t> code) {
+    const auto bytes = std::as_bytes(code);
+    const std::uint64_t encoding = ShaderRecompiler::GcnGuestShaders() ? 1u : 0u;
+    return {ShaderRecompiler::HashBytes(bytes, 0x636f646566616374ull + encoding), ShaderRecompiler::HashBytes(bytes, 0x9e6c63d0876a9a47ull + encoding)};
+}
+
+FactsKey SwappcFactsKey(const FactsKey& code, const ShaderRecompiler::SwappcInfo& swappc) {
+    const std::array<std::uint64_t, 4> words{code.low, code.high, swappc.fetchCallAllowed ? 1u : 0u, (static_cast<std::uint64_t>(swappc.userDataBaseRegister) << 32u) | swappc.userDataCount};
+    const auto bytes = std::as_bytes(std::span(words));
+    return {ShaderRecompiler::HashBytes(bytes, 0x7377617070636661ull), ShaderRecompiler::HashBytes(bytes, 0xc2b2ae3d27d4eb4full)};
+}
+
 std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto header = ReadHeader(snapshot);
@@ -1534,11 +1632,30 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     } release{scratch};
     auto& decoded = scratch;
     plan->registration = registration;
-    try {
+    const bool remembered = registration && deferred != nullptr;
+    const auto codeKey = remembered ? CodeFactsKey(code) : FactsKey{};
+    auto codeFacts = remembered ? RegistrationFacts::Instance().Find(codeKey) : std::nullopt;
+    bool programDecoded = false;
+    const auto decode = [&] {
+        if (programDecoded) return;
         ShaderRecompiler::DecodeRdnaProgram(code, decoded);
-    } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
-        if (deferred == nullptr) throw;
-        return defer(error.what());
+        programDecoded = true;
+    };
+    const auto barrier = [&] {
+        if (codeFacts) return *codeFacts != 0;
+        return std::ranges::any_of(decoded.instructions, [](const auto& instruction) { return instruction.op == ShaderRecompiler::RdnaOpcode::SBarrier; });
+    };
+    if (!codeFacts) {
+        try {
+            decode();
+        } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
+            if (deferred == nullptr) throw;
+            return defer(error.what());
+        }
+        if (remembered) {
+            codeFacts = barrier() ? 1u : 0u;
+            RegistrationFacts::Instance().Store(codeKey, *codeFacts);
+        }
     }
     std::optional<ShaderRecompiler::ShaderComputeStageInfo> compute;
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
@@ -1567,9 +1684,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     } else {
         const auto routing = RegisterValue(state.context, 0x2d5);
         wave = (routing & 0x00400000u) != 0 ? 32u : 64u;
-        const bool unroutedBarrier = routing == 0 && std::ranges::any_of(decoded.instructions, [](const auto& instruction) {
-            return instruction.op == ShaderRecompiler::RdnaOpcode::SBarrier;
-        });
+        const bool unroutedBarrier = routing == 0 && barrier();
         if (registration && stage == Stage::Vertex && (((routing & 0x02002024u) == 0x2000u && ProgramUsesWorkgroup(snapshot, codeOffset)) || unroutedBarrier)) {
             if (unroutedBarrier && deferred != nullptr) return defer("its s_barrier depends on draw routing");
             return nullptr;
@@ -1593,7 +1708,18 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     }
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
-        if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(decoded, &plan->swappc)) {
+        constexpr std::uint64_t Unresolvable = std::uint64_t{1} << 32u;
+        const auto swappcKey = remembered ? SwappcFactsKey(codeKey, plan->swappc) : FactsKey{};
+        const auto swappcFacts = remembered ? RegistrationFacts::Instance().Find(swappcKey) : std::nullopt;
+        std::optional<std::uint32_t> counter;
+        if (swappcFacts) {
+            if ((*swappcFacts & Unresolvable) != 0) counter = static_cast<std::uint32_t>(*swappcFacts);
+        } else {
+            decode();
+            counter = ShaderRecompiler::UnresolvableSwappcTarget(decoded, &plan->swappc);
+            if (remembered) RegistrationFacts::Instance().Store(swappcKey, counter ? Unresolvable | *counter : 0u);
+        }
+        if (counter) {
             char reason[96];
             std::snprintf(reason, sizeof(reason), "its s_swappc_b64 at program counter 0x%x calls a computed target", *counter);
             return defer(reason);
