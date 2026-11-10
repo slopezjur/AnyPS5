@@ -507,7 +507,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
         rethrowFailure();
         checkStopping();
         reserveOutputs(tail);
-        tail.shaders = shaders;
+        tail.shaders = shaders.Share();
         tail.serial = stalled.serial;
         tail.received = ++eventSerial;
         if (capture != nullptr) capture->Take(captured, tail.serial, captureTime(), tail.heldAtSubmit);
@@ -587,7 +587,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             AgcDriverDeliverEopInterrupt(0);
             return;
         }
-        submission.shaders = shaders;
+        submission.shaders = shaders.Share();
         submission.serial = accepted + 1;
 
         submission.received = ++eventSerial;
