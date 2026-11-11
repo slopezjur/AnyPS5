@@ -2,7 +2,9 @@
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -66,6 +68,38 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     };
     IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
+    static const bool selectChain = std::getenv("APS5_NO_PACKED_F16_NAN_BRANCH") != nullptr;
+    const bool inputsFlushed = floatMode.has_value() && (floatMode->floatMode & 0x40u) == 0u;
+    if (!quietSnan && !inst.destination.clamp && !inputsFlushed && !selectChain) {
+        const std::uint32_t count = accumulator ? 3u : inst.sourceCount;
+        if (count < 2u || count > 3u) throw std::runtime_error("packed f16 at pc " + std::to_string(inst.programCounter) + " has " + std::to_string(count) + " sources");
+        if (native && fp16Overflow()) {
+            const auto overflowLane = [&](bool high) {
+                IrU32 lane(high ? ir.ShiftRightLogical(result.Value(), ir.Constant(16u)) : ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)));
+                IrU1 overflow(ir.IEqual(ir.BitwiseAnd(lane.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
+                for (std::uint32_t index = 0u; index < count; ++index) {
+                    overflow = IrU1(ir.LogicalAnd(overflow.Value(), ir.INotEqual(ir.BitwiseAnd(sourceLaneBits(index, high).Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u))));
+                }
+                return IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(lane.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), lane.Value()));
+            };
+            result = packU16Lanes(overflowLane(false), overflowLane(true));
+        }
+        std::uint32_t modifiers = (count << 15u) | (ieeeMode ? 1u << 17u : 0u);
+        std::array<IrU32, 3> sources{};
+        for (std::uint32_t index = 0u; index < 3u; ++index) {
+            if (index >= count) {
+                sources[index] = IrU32(ir.Constant(0u));
+                continue;
+            }
+            const RdnaOperand& operand = accumulator && index == 2u ? accumulatorOperand(inst) : sourceAt(inst, index);
+            sources[index] = readF16SourceBits(operand);
+            const std::uint32_t bits = (operand.opSel ? 1u : 0u) | (operand.opSelHi ? 2u : 0u) | (operand.absolute ? 4u : 0u) | (operand.negate ? 8u : 0u) | (operand.negateHi ? 16u : 0u);
+            modifiers |= bits << (index * 5u);
+        }
+        result = IrU32(ir.Emit(IrOpcode::PackedF16NanResult, IrType::U32, {&result.Value(), &sources[0].Value(), &sources[1].Value(), &sources[2].Value(), &ir.Constant(modifiers)}));
+        writeRawU32(inst.destination, result);
+        return true;
+    }
     if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
         const auto isNan = [&](const IrU32& bits) {
             return IrU1(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));

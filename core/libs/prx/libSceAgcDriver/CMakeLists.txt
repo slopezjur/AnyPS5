@@ -3078,6 +3078,14 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_mix_f16_exact_compare PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_packed_f16_nan_compare COMMAND ${CMAKE_COMMAND}
+            -DFIXTURE=$<TARGET_FILE:agc_driver_packed_f16_nan_result_tests>
+            -DOUTPUT_ROOT=${CMAKE_CURRENT_BINARY_DIR}/packed-f16-nan
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/PackedF16NanCompare.cmake)
+    set_tests_properties(agc_driver_packed_f16_nan_compare PROPERTIES TIMEOUT 300 SKIP_REGULAR_EXPRESSION "packed f16 NaN compare: skipped, no usable Vulkan device")
+    if(WIN32)
+        set_tests_properties(agc_driver_packed_f16_nan_compare PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_pipelined_dma_legacy COMMAND agc_driver_pipelined_dma_tests --legacy)
     set_tests_properties(agc_driver_pipelined_dma_legacy PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     if(WIN32)

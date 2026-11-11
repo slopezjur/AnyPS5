@@ -1589,6 +1589,49 @@ std::uint32_t EmitFPMul16x2(SpirvEmitterState& state, std::uint32_t arg0, std::u
     return Unary(state, spv::OpBitcast, TypeU32(state), Exact(state, product));
 }
 
+std::uint32_t EmitPackedF16NanResult(SpirvEmitterState& state, std::uint32_t result, std::uint32_t source0, std::uint32_t source1, std::uint32_t source2, const IrValue* modifiers) {
+    const auto flags = modifiers->ImmediateU32();
+    const auto count = (flags >> 15u) & 3u;
+    const bool ieeeMode = (flags & (1u << 17u)) != 0u;
+    if (count < 2u) FailEmit("packed f16 NaN result needs two or three sources");
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto op = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
+    const auto test = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, boolean, lhs, rhs); };
+    const auto nanLanes = op(spv::OpBitwiseAnd, op(spv::OpIAdd, op(spv::OpBitwiseAnd, result, constant(0x7fff7fffu)), constant(0x03ff03ffu)), constant(0x80008000u));
+    const auto anyNan = test(spv::OpINotEqual, nanLanes, constant(0u));
+    return EmitValueIfElse(state, anyNan, u32, [&] {
+        const std::array<std::uint32_t, 3> sources{source0, source1, source2};
+        const auto magnitude = [&](std::uint32_t bits) { return op(spv::OpBitwiseAnd, bits, constant(0x7fffu)); };
+        const auto isNan = [&](std::uint32_t bits) { return test(spv::OpUGreaterThan, magnitude(bits), constant(0x7c00u)); };
+        const auto quiet = [&](std::uint32_t bits) { return ieeeMode ? op(spv::OpBitwiseOr, bits, constant(0x0200u)) : bits; };
+        const auto laneOf = [&](std::uint32_t index, bool high) {
+            const auto bitsOf = [&](std::uint32_t bit) { return (flags >> (index * 5u + bit)) & 1u; };
+            auto bits = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, sources[index], constant(bitsOf(high ? 1u : 0u) != 0u ? 16u : 0u)), constant(0xffffu));
+            if (bitsOf(2u) != 0u) bits = op(spv::OpBitwiseAnd, bits, constant(0x7fffu));
+            if (bitsOf(high ? 4u : 3u) != 0u) bits = op(spv::OpBitwiseXor, bits, constant(0x8000u));
+            return bits;
+        };
+        const auto infZero = [&](std::uint32_t inf, std::uint32_t zero) {
+            return Binary(state, spv::OpLogicalAnd, boolean, test(spv::OpIEqual, magnitude(inf), constant(0x7c00u)), test(spv::OpIEqual, magnitude(zero), constant(0u)));
+        };
+        const auto lane = [&](bool high) {
+            std::array<std::uint32_t, 3> bits{};
+            for (std::uint32_t index = 0u; index < count; ++index) bits[index] = laneOf(index, high);
+            auto value = high ? op(spv::OpShiftRightLogical, result, constant(16u)) : op(spv::OpBitwiseAnd, result, constant(0xffffu));
+            value = Select(state, u32, isNan(value), constant(0xfe00u), value);
+            for (std::uint32_t index = count; index-- > 0u;) {
+                auto selected = isNan(bits[index]);
+                if (index == 2u) selected = Binary(state, spv::OpLogicalAnd, boolean, selected, Unary(state, spv::OpLogicalNot, boolean, Binary(state, spv::OpLogicalOr, boolean, infZero(bits[0], bits[1]), infZero(bits[1], bits[0]))));
+                value = Select(state, u32, selected, quiet(bits[index]), value);
+            }
+            return value;
+        };
+        return op(spv::OpBitwiseOr, lane(false), op(spv::OpShiftLeftLogical, lane(true), constant(16u)));
+    }, [&] { return result; });
+}
+
 std::uint32_t EmitF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
     if (NativeF16Rte(state)) return EmitNativeF32ToF16BitsRte(state, value);
     const auto u32 = TypeU32(state);

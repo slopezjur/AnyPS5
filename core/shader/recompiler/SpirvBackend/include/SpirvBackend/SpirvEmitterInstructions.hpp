@@ -15,6 +15,7 @@ std::uint32_t EmitCompositeExtractU64(SpirvEmitterState& state, std::uint32_t ar
 std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitFPAdd16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitFPMul16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
+std::uint32_t EmitPackedF16NanResult(SpirvEmitterState& state, std::uint32_t result, std::uint32_t source0, std::uint32_t source1, std::uint32_t source2, const IrValue* modifiers);
 std::uint32_t EmitFPSaturate32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitIAdd64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitISub64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
