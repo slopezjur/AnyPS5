@@ -3070,6 +3070,14 @@ if(BUILD_TESTING)
     set_property(TEST agc_driver_linear_target_draw_bindings APPEND PROPERTY ENVIRONMENT "APS5_NO_READ_ONLY_LEASE_SKIP=1")
     # Main's 4_4_4_4 target-merge state test describes a linear target's resident surface.
     set_tests_properties(agc_driver_graphics PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RESIDENT_LINEAR=1")
+    add_test(NAME agc_driver_mix_f16_exact_compare COMMAND ${CMAKE_COMMAND}
+            -DFIXTURE=$<TARGET_FILE:agc_driver_mix_f16_exact_tests>
+            -DOUTPUT_ROOT=${CMAKE_CURRENT_BINARY_DIR}/mix-f16-exact
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/MixF16ExactCompare.cmake)
+    set_tests_properties(agc_driver_mix_f16_exact_compare PROPERTIES TIMEOUT 400 SKIP_REGULAR_EXPRESSION "mix f16 exact compare: skipped, no usable Vulkan device")
+    if(WIN32)
+        set_tests_properties(agc_driver_mix_f16_exact_compare PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_pipelined_dma_legacy COMMAND agc_driver_pipelined_dma_tests --legacy)
     set_tests_properties(agc_driver_pipelined_dma_legacy PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     if(WIN32)

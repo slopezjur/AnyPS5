@@ -1105,10 +1105,36 @@ std::uint32_t InterpolateF16Fast(SpirvEmitterState& state, std::uint32_t a, std:
     }, [&] { return CallInterpolate(state, a, b, c, true, 0u); });
 }
 
+std::uint32_t InterpolateF16Tie(SpirvEmitterState& state, std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+    const auto f32 = TypeF32(state);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto op = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
+    const auto test = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, boolean, lhs, rhs); };
+    const auto either = [&](std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, spv::OpLogicalOr, boolean, lhs, rhs); };
+    const auto magnitude = [&](std::uint32_t value) { return op(spv::OpBitwiseAnd, Unary(state, spv::OpBitcast, u32, value), ConstantU32(state, 0x7fffffffu)); };
+    const auto rounded = Glsl(state, f32, GLSLstd450Fma, a, b, c);
+    const auto mag = magnitude(rounded);
+    const auto exponent = op(spv::OpShiftRightLogical, mag, ConstantU32(state, 23u));
+    const auto shift = Glsl(state, u32, GLSLstd450UMin, op(spv::OpISub, exponent, ConstantU32(state, 94u)), ConstantU32(state, 19u));
+    const auto midpoint = test(spv::OpIEqual, op(spv::OpShiftLeftLogical, mag, shift), ConstantU32(state, 0x80000000u));
+    const auto tieRange = Binary(state, spv::OpLogicalAnd, boolean, test(spv::OpUGreaterThanEqual, exponent, ConstantU32(state, 103u)), test(spv::OpULessThanEqual, exponent, ConstantU32(state, 142u)));
+    auto slow = either(test(spv::OpUGreaterThanEqual, mag, ConstantU32(state, 0x7f800000u)), test(spv::OpIEqual, exponent, ConstantU32(state, 102u)));
+    slow = either(slow, Binary(state, spv::OpLogicalAnd, boolean, tieRange, midpoint));
+    if (!state.float32DenormPreserve || state.float32FlushToZero) {
+        const auto denormal = [&](std::uint32_t value) { return test(spv::OpULessThan, op(spv::OpISub, magnitude(value), ConstantU32(state, 1u)), ConstantU32(state, 0x007fffffu)); };
+        slow = either(slow, either(denormal(a), denormal(b)));
+        if (c != ConstantF32(state, 0u) && c != ConstantF32(state, 0x80000000u)) slow = either(slow, denormal(c));
+    }
+    return EmitValueIfElse(state, slow, f32, [&] { return InterpolateF16Fast(state, a, b, c); }, [&] { return rounded; });
+}
+
 }
 
 std::uint32_t EmitFPInterpolateF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, const IrValue* mode) {
     static const bool f64Only = std::getenv("APS5_NO_MIX_F32") != nullptr;
+    static const bool exactOnly = std::getenv("APS5_NO_MIX_TIE_FAST") != nullptr;
+    if (state.fusedFma && !f64Only && !exactOnly && mode->ImmediateU32() == 0u) return InterpolateF16Tie(state, arg0, arg1, arg2);
     if (state.fusedFma && !f64Only && mode->ImmediateU32() == 0u) return InterpolateF16Fast(state, arg0, arg1, arg2);
     return CallInterpolate(state, arg0, arg1, arg2, true, mode->ImmediateU32());
 }
