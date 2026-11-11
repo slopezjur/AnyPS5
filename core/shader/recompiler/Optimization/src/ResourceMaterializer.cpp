@@ -401,6 +401,7 @@ struct TableCounters {
     std::atomic<std::uint64_t> keys{0};
     std::array<std::atomic<std::uint64_t>, PoisonReasonCount> poison{};
     std::atomic<std::uint64_t> narrowed{0};
+    std::atomic<std::uint64_t> unread{0};
     std::atomic<std::uint64_t> narrowSkipped{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(NarrowSkip::Count)> narrowSkips{};
     std::atomic<std::uint64_t> narrowPositions{0};
@@ -456,6 +457,7 @@ void reportTables() {
         skips += " " + std::string(NarrowSkipNames[reason]) + "=" + std::to_string(count);
         if (reason == static_cast<std::size_t>(NarrowSkip::KeyScan)) skips += " (up to " + std::to_string(counters.narrowPositions.exchange(0, std::memory_order_relaxed)) + " positions, APS5_IMAGE_TABLE_KEY_SCAN " + std::to_string(TableKeyScanLimit()) + ")";
     }
+    if (const auto unread = counters.unread.exchange(0, std::memory_order_relaxed); unread != 0) std::fprintf(stderr, "[image-table] (10 s): %llu bindless pointer columns left unread\n", static_cast<unsigned long long>(unread));
     std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %.1f ms\n",
         static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.selected.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
         static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
@@ -1115,6 +1117,31 @@ private:
             }
             return;
         }
+        if (Unread(column, source, records)) {
+            unread();
+            const auto layout = Layout(column, records);
+            records.states = layout.states;
+            records.readRanges = layout.readRanges;
+            auto next = layout.split.begin();
+            for (std::uint32_t record = 0; record < records.keys; record++) {
+                if (records.states[record] != RecordState::Read) continue;
+                DescriptorValue value;
+                value.dwordCount = 8u;
+                if (layout.whole[record] != ColumnLayout::Unread) {
+                    value.availableDwordMask = static_cast<std::uint8_t>((1u << column.dwordCount) - 1u);
+                } else {
+                    for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
+                        if (next->second[dword] != ColumnLayout::Unread) value.availableDwordMask |= static_cast<std::uint8_t>(1u << dword);
+                    }
+                    ++next;
+                }
+                records.words[record] = WordsIndex(records, value);
+            }
+            if (layout.low < layout.high) tables.ranges.emplace_back(layout.low, layout.high - layout.low);
+            Seal(records);
+            tableCounters().unread.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         const bool memoized = TableSnapshotReuse() && !records.narrowed && records.keys != 0u;
         const ColumnKey key{records.base, records.size, records.records, records.keys, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, column.foldedAddend, column.foldedCarry, column.address, column.sampler};
         if (memoized && Reuse(key, column, records, false)) return;
@@ -1163,6 +1190,18 @@ private:
         if (ranged) tables.ranges.emplace_back(layout->low, layout->high - layout->low);
         Seal(records);
         if (memoized) Remember(key, records, std::vector<std::pair<std::uint64_t, std::uint32_t>>(layout->runs), std::move(read), ranged ? layout->low : 0u, ranged ? layout->high : 0u, FlatWordsIndex() ? layout : nullptr);
+    }
+
+    bool Unread(const TableColumn& column, std::uint32_t source, const ColumnRecords& records) const {
+        static const bool enabled = std::getenv("APS5_NO_BINDLESS_UNREAD_TABLES") == nullptr;
+        if (!enabled || !runtime.bindlessImages || !column.address || column.sampler || column.indirect || records.narrowed || !records.outside) return false;
+        bool used = false;
+        for (std::uint32_t resource = 0; resource < plan.info.images.size(); ++resource) {
+            if (plan.info.images[resource].source != source) continue;
+            if (!ResourceMaterializer::BindlessImage(plan.info, plan.stage, resource)) return false;
+            used = true;
+        }
+        return used && std::ranges::none_of(plan.info.samplers, [&](const SamplerResource& sampler) { return sampler.source == source; });
     }
 
     ColumnLayout Layout(const TableColumn& column, const ColumnRecords& records) {

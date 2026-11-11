@@ -1754,7 +1754,8 @@ RecompileResult materializeVariant(SourceEntry& source, const RecompileRequest& 
 RecompileResult recompileOnce(const RecompileRequest& request) {
     static_cast<void>(RequestInputInfo(request));
     RequestMemoryView memory(request.context.memory);
-    const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
+    auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
+    runtime.bindlessImages = request.target.bindlessImages;
     ResourceSnapshot snapshot;
     constexpr ResourceMaterializer materializer;
     if (!request.useCache) {
@@ -2116,9 +2117,11 @@ namespace {
 
 // The capture's materialization; with pure flat slots in the plan the walk's read addresses are
 // traced into the capture (ResourceCapture::readTrace).
-void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime, bool allowDirectImageRefusal) {
+void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime, const RecompileRequest& request) {
     const auto& plan = *capture.plan;
+    const bool allowDirectImageRefusal = request.target.bdaAbiVersion == BdaAbi::Version;
     SrtRuntime traced = runtime;
+    traced.bindlessImages = request.target.bindlessImages;
     traced.userDataUse = &capture.userDataUse;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, allowDirectImageRefusal);
@@ -2146,7 +2149,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
         capture->plan = makeResourcePlan(request);
     }
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
+    materializeCapture(*capture, runtime, request);
     return capture;
 }
 
@@ -2226,7 +2229,7 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
     capture->plan = captureSourcePlan(*handle->source, request);
-    materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
+    materializeCapture(*capture, runtime, request);
     return capture;
 }
 
@@ -2277,7 +2280,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     capture->source = handle.source;
     capture->plan = captureSourcePlan(*handle.source, request);
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime, request.target.bdaAbiVersion == BdaAbi::Version);
+    materializeCapture(*capture, runtime, request);
     return capture;
 }
 
