@@ -300,6 +300,12 @@ alignas(256) constexpr std::array<std::uint32_t, 25> ReadPointerCode{
     0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 23> UnboundedReadPointerCode{
+    0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
+    0x20000000u, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0x360200bfu, 0x7e040280u, 0xf0000f08u, 0x00090401u,
+    0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 37> RuntimePointerCode{
     0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
     0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0x361c0081u, 0x341c1c83u, 0xe03410f0u, 0x80020c0eu,
@@ -623,6 +629,11 @@ bool Faulted(const Outcome& outcome) {
 bool BindlessHeap() {
     const char* value = std::getenv("APS5_BINDLESS_IMAGES");
     return value != nullptr && std::string_view(value) == "1";
+}
+
+bool TableKeyScanOff() {
+    const char* value = std::getenv("APS5_IMAGE_TABLE_KEY_SCAN");
+    return value != nullptr && std::string_view(value) == "0";
 }
 
 void RequireSnapshotFault(const Outcome& outcome, const char* reason, const std::string& what, bool unmapped = false) {
@@ -1544,6 +1555,37 @@ void RunPointerTests(AgcDriver::VulkanDevice& device) {
         Require(Group(reads, group) == Group(control, 0), "pointer image table read: key " + Hex(readKeys[group]) + " differs from the direct binding of its masked entry");
     }
     RequireRed(reads, 4, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "pointer image table read: key 0x1ff masked to entry 255");
+}
+
+void RunUnreadLayoutTests(AgcDriver::VulkanDevice& device) {
+    Require(BindlessHeap() && TableKeyScanOff(), "unread layout: needs APS5_BINDLESS_IMAGES=1 and APS5_IMAGE_TABLE_KEY_SCAN=0");
+    Fill();
+    std::fill(Root.begin(), Root.end(), 0u);
+    SetEntry(0, Image(FloatTexels.data(), Format32Float));
+    SetEntry(1, Image(UintTexels.data(), Format32UInt));
+    SetEntry(2, Image(SintTexels.data(), Format32SInt));
+    Keys = {};
+    Keys[0] = 2;
+    Keys[1] = 0x08000000u;
+    const auto before = ShaderRecompiler::ResourceMaterializer::TableReuse().unreadShared;
+    const auto layoutOnly = RunPointer(device, UnboundedReadPointerCode, 2);
+    Require(!Faulted(layoutOnly), "unread layout: valid entries faulted:\n" + layoutOnly.log);
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 2> expected{{{0u, 2u}, {1u, 0u}}};
+    for (const auto& [group, entry] : expected) {
+        const auto* words = Root.data() + (PaletteOffset + entry * 32u) / 4u;
+        const auto control = RunDirectCode(device, ReadDirectCode, PointClamp, std::span<const std::uint32_t>(words, 4));
+        Require(Group(layoutOnly, group) == Group(control, 0), "unread layout: key " + Hex(Keys[group]) + " differs from the direct binding of entry " + std::to_string(entry));
+    }
+    Require(ShaderRecompiler::ResourceMaterializer::TableReuse().unreadShared == before, "unread layout: the first capture of the table reused a snapshot");
+    const auto reused = RunPointer(device, UnboundedReadPointerCode, 2);
+    Require(ShaderRecompiler::ResourceMaterializer::TableReuse().unreadShared > before, "unread layout: a second capture of an unchanged table did not reuse its layout-only snapshot");
+    Require(!Faulted(reused) && reused.words == layoutOnly.words && reused.variantId == layoutOnly.variantId, "unread layout: a reused layout-only snapshot read differently:\n" + reused.log);
+    if (device.VendorId() != 0x10005u) {
+        Keys[0] = 300;
+        const auto past = RunPointer(device, UnboundedReadPointerCode, 1);
+        RequireSnapshotFault(past, "unmapped", "unread layout: an entry past the captured palette did not fault as unmapped from a reused snapshot", true);
+    }
+    std::puts("unread layout: a layout-only bindless pointer table is reused across captures and reads the same entries");
 }
 
 Outcome RunRuntimePointer(AgcDriver::VulkanDevice& device, std::uint32_t groups, std::uint64_t palette) {
@@ -2575,6 +2617,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--runtime-address") {
             RunRuntimeAddressTests(*device);
             RunPixelRuntimeAddressTests(*device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--unread-layout") {
+            RunUnreadLayoutTests(*device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-only") {

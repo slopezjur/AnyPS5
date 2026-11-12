@@ -425,6 +425,7 @@ struct TableReuseTotals {
     std::atomic<std::uint64_t> columns{0};
     std::atomic<std::uint64_t> resolutions{0};
     std::atomic<std::uint64_t> resolutionsShared{0};
+    std::atomic<std::uint64_t> unreadShared{0};
 };
 
 TableReuseTotals& tableReuseTotals() {
@@ -580,6 +581,21 @@ constexpr std::size_t ColumnMemoWords = std::size_t{1} << 24u;
 
 std::vector<ColumnMemo>& ColumnMemos() {
     thread_local std::vector<ColumnMemo>* slot = nullptr;
+    return ThreadOwned(slot);
+}
+
+struct UnreadMemo {
+    ColumnKey key;
+    std::shared_ptr<const ColumnLayout> layout;
+    ColumnContents contents;
+
+    std::size_t Footprint() const {
+        return layout->Footprint() + contents.codes.size() + contents.words.size() * 9u + contents.readRanges.size() * 4u;
+    }
+};
+
+std::vector<UnreadMemo>& UnreadMemos() {
+    thread_local std::vector<UnreadMemo>* slot = nullptr;
     return ThreadOwned(slot);
 }
 
@@ -1118,16 +1134,20 @@ private:
             return;
         }
         if (Unread(column, source, records)) {
+            tableCounters().unread.fetch_add(1, std::memory_order_relaxed);
+            const bool memoized = TableSnapshotReuse() && records.keys != 0u;
+            const auto key = KeyOf(column, records);
+            if (memoized && ReuseUnread(key, column, records)) return;
             unread();
-            const auto layout = Layout(column, records);
-            records.states = layout.states;
-            records.readRanges = layout.readRanges;
-            auto next = layout.split.begin();
+            const auto layout = std::make_shared<const ColumnLayout>(Layout(column, records));
+            records.states = layout->states;
+            records.readRanges = layout->readRanges;
+            auto next = layout->split.begin();
             for (std::uint32_t record = 0; record < records.keys; record++) {
                 if (records.states[record] != RecordState::Read) continue;
                 DescriptorValue value;
                 value.dwordCount = 8u;
-                if (layout.whole[record] != ColumnLayout::Unread) {
+                if (layout->whole[record] != ColumnLayout::Unread) {
                     value.availableDwordMask = static_cast<std::uint8_t>((1u << column.dwordCount) - 1u);
                 } else {
                     for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
@@ -1137,13 +1157,13 @@ private:
                 }
                 records.words[record] = WordsIndex(records, value);
             }
-            if (layout.low < layout.high) tables.ranges.emplace_back(layout.low, layout.high - layout.low);
+            if (layout->low < layout->high) tables.ranges.emplace_back(layout->low, layout->high - layout->low);
             Seal(records);
-            tableCounters().unread.fetch_add(1, std::memory_order_relaxed);
+            if (memoized) RememberUnread(key, records, layout);
             return;
         }
         const bool memoized = TableSnapshotReuse() && !records.narrowed && records.keys != 0u;
-        const ColumnKey key{records.base, records.size, records.records, records.keys, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, column.foldedAddend, column.foldedCarry, column.address, column.sampler};
+        const auto key = KeyOf(column, records);
         if (memoized && Reuse(key, column, records, false)) return;
         if (memoized && !column.address && records.size != 0u && runtime.stampWrites != nullptr) {
             const auto span = std::min<std::uint64_t>(records.size, static_cast<std::uint64_t>(column.addend) + column.offset + static_cast<std::uint64_t>(records.keys) * column.stride + column.dwordCount * 4u);
@@ -1190,6 +1210,40 @@ private:
         if (ranged) tables.ranges.emplace_back(layout->low, layout->high - layout->low);
         Seal(records);
         if (memoized) Remember(key, records, std::vector<std::pair<std::uint64_t, std::uint32_t>>(layout->runs), std::move(read), ranged ? layout->low : 0u, ranged ? layout->high : 0u, FlatWordsIndex() ? layout : nullptr);
+    }
+
+    static ColumnKey KeyOf(const TableColumn& column, const ColumnRecords& records) {
+        return {records.base, records.size, records.records, records.keys, column.stride, column.addend, column.offset, column.dwordCount, column.maxKey, column.foldedAddend, column.foldedCarry, column.address, column.sampler};
+    }
+
+    bool ReuseUnread(const ColumnKey& key, const TableColumn& column, ColumnRecords& records) {
+        auto& memos = UnreadMemos();
+        const auto found = std::find_if(memos.begin(), memos.end(), [&](const UnreadMemo& entry) { return entry.key == key; });
+        if (found == memos.end() || !ReplayChecks(*found->layout, column, records)) return false;
+        records.contents = found->contents;
+        records.sealed = true;
+        if (found->layout->low < found->layout->high) tables.ranges.emplace_back(found->layout->low, found->layout->high - found->layout->low);
+        tableReuseTotals().unreadShared.fetch_add(1, std::memory_order_relaxed);
+        std::rotate(memos.begin(), found, found + 1);
+        return true;
+    }
+
+    void RememberUnread(const ColumnKey& key, const ColumnRecords& records, std::shared_ptr<const ColumnLayout> layout) {
+        auto& memos = UnreadMemos();
+        auto found = std::find_if(memos.begin(), memos.end(), [&](const UnreadMemo& entry) { return entry.key == key; });
+        if (found == memos.end()) found = memos.emplace(memos.end());
+        found->key = key;
+        found->layout = std::move(layout);
+        found->contents = records.contents;
+        if (found->Footprint() > ColumnMemoWords) {
+            memos.erase(found);
+            return;
+        }
+        std::rotate(memos.begin(), found, found + 1);
+        std::size_t kept = 0;
+        std::size_t footprint = 0;
+        while (kept < memos.size() && kept < ColumnMemoEntries && footprint + memos[kept].Footprint() <= ColumnMemoWords) footprint += memos[kept++].Footprint();
+        memos.resize(kept);
     }
 
     bool Unread(const TableColumn& column, std::uint32_t source, const ColumnRecords& records) const {
@@ -3061,7 +3115,7 @@ std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
 
 ImageTableReuseCounts ResourceMaterializer::TableReuse() {
     auto& totals = tableReuseTotals();
-    return {totals.unwritten.load(std::memory_order_relaxed), totals.compared.load(std::memory_order_relaxed), totals.wordsRead.load(std::memory_order_relaxed), totals.shared.load(std::memory_order_relaxed), totals.columns.load(std::memory_order_relaxed), totals.resolutions.load(std::memory_order_relaxed), totals.resolutionsShared.load(std::memory_order_relaxed)};
+    return {totals.unwritten.load(std::memory_order_relaxed), totals.compared.load(std::memory_order_relaxed), totals.wordsRead.load(std::memory_order_relaxed), totals.shared.load(std::memory_order_relaxed), totals.columns.load(std::memory_order_relaxed), totals.resolutions.load(std::memory_order_relaxed), totals.resolutionsShared.load(std::memory_order_relaxed), totals.unreadShared.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t ResourceMaterializer::EvaluateNanoseconds() {
