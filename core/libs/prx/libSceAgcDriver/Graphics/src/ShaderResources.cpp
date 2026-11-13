@@ -4955,7 +4955,7 @@ bool AnyPendingCpuWrites(const Context& context) {
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
@@ -4968,7 +4968,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     };
     if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
         Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
+        recorder->SyncThrough(address, bytes, waitUnlocked);
         return true;
     }
     return false;
