@@ -3188,6 +3188,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 materializeSnapshot(plan, runtime, walker, nextSnapshot, activeSources);
                 const auto afterSnapshot = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
                 TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
+                materializeStoreTables(plan, runtime, walker, nextSnapshot.storeTables);
                 const auto afterTables = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
                 const auto afterImageGeneration = runtime.imageViewGeneration != nullptr ? runtime.imageViewGeneration(runtime.userContext) : 0u;
                 for (const auto& table : nextSnapshot.tables.tables) {
@@ -3204,7 +3205,6 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 materializeForcedDegamma(plan, nextSnapshot);
                 materializeTables(plan, nextSnapshot);
                 materializeSrtGuards(plan, nextSnapshot);
-                materializeStoreTables(plan, runtime, walker, nextSnapshot.storeTables);
                 if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
                 completed = true;
                 break;

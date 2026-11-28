@@ -6400,6 +6400,7 @@ void verifyStoreTables() {
     const auto& field = onlyTable(*fieldPlan, "store table bit field");
     require(field.address && !field.direct && !field.bounded && field.offset == 48u && field.stride == 16u && field.maxKey == 31u && field.maxIndex == 0u, "store table bit field: the table is wrong");
     require(fieldPlan->descriptorSources.at(field.source).dwordCount == 2u, "store table bit field: the table base is not a 64-bit pointer");
+    const auto memoInitial = ResultMemoBytes();
     const auto fieldCompiled = CompileTable(request(fieldCode));
     const auto& fieldStores = fieldCompiled.result->storeTables;
     require(fieldStores.fallback == StoreTableFallback::None && fieldStores.tables.size() == 1u && fieldStores.tables[0].base == address && fieldStores.tables[0].keys == 32u, "store table bit field: the dispatch did not read 32 records from the table");
@@ -6409,6 +6410,7 @@ void verifyStoreTables() {
         const auto movedAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(movedRoot.data()));
         const std::array<std::uint32_t, 2> movedUserData{static_cast<std::uint32_t>(movedAddress), static_cast<std::uint32_t>(movedAddress >> 32u)};
         const auto memoBefore = ResultMemoBytes();
+        require(memoBefore > memoInitial, "store table bit field: the first compile did not populate the result memo");
         const auto movedCompiled = CompileTable(TableRequest(fieldCode, movedUserData));
         const bool maskedMemo = std::getenv("APS5_NO_MASKED_RESULT_MEMO") == nullptr;
         require((!maskedMemo || ResultMemoBytes() == memoBefore) && movedCompiled.result->storeTables.tables.size() == 1u && movedCompiled.result->storeTables.tables[0].base == movedAddress, "store table bit field: moving the table did not patch the masked donor's store tables");
@@ -6476,6 +6478,34 @@ void verifyStoreTables() {
         ResourceSnapshot shortSnapshot;
         ResourceMaterializer{}.Materialize(shortHolderPlan, SrtRuntime{}, shortSnapshot);
         require(shortSnapshot.storeTables.fallback == StoreTableFallback::NotBuffer && shortSnapshot.storeTables.tables.empty() && shortSnapshot.storeTables.missPc == held.pc, "store table holder width: a holder source narrower than 4 dwords did not fall back as NotBuffer");
+    }
+    {
+        struct EpochState {
+            std::uint64_t base = 0;
+            std::array<std::uint32_t, 4> initial{};
+            std::array<std::uint32_t, 4> settled{};
+            std::uint64_t epoch = 1u;
+            std::uint32_t reads = 0u;
+        };
+        EpochState state{address, TableV(holder.data(), 0u, 32u), holderV};
+        SrtRuntime epochRuntime{userData};
+        epochRuntime.userContext = &state;
+        epochRuntime.readMemory = +[](void* ctx, std::uint64_t at, std::uint32_t* value) {
+            auto& self = *static_cast<EpochState*>(ctx);
+            if (at < self.base || at >= self.base + sizeof(self.initial)) return false;
+            const auto index = static_cast<std::size_t>((at - self.base) / sizeof(std::uint32_t));
+            if (++self.reads == 5u) ++self.epoch;
+            const auto& words = self.epoch == 1u ? self.initial : self.settled;
+            *value = words[index];
+            return true;
+        };
+        epochRuntime.readSpecializationMemory = epochRuntime.readMemory;
+        epochRuntime.descriptorScope = +[](void* ctx, std::size_t) -> std::uint64_t {
+            return static_cast<EpochState*>(ctx)->epoch;
+        };
+        ResourceSnapshot epochSnapshot;
+        ResourceMaterializer{}.Materialize(*holderPlan, epochRuntime, epochSnapshot);
+        require(std::ranges::equal(epochSnapshot.flattenedSrt, holderV) && epochSnapshot.storeTables.fallback == StoreTableFallback::None && epochSnapshot.storeTables.tables.size() == 1u && epochSnapshot.storeTables.tables[0].size == sizeof(holder) && epochSnapshot.storeTables.tables[0].keys == 4u, "store table epoch retry: a descriptor-scope change during store-table evaluation left a mixed snapshot");
     }
 
     constexpr auto cutBytes = static_cast<std::uint32_t>(sizeof(holder)) - 8u;
